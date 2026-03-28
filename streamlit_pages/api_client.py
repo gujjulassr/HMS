@@ -492,3 +492,34 @@ def admin_list_sessions(date_str: str = "", status: str = "",
     r = httpx.get(f"{BASE_URL}/admin/sessions", params=params, headers=_headers(), timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
+
+
+# ─── Chat ──────────────────────────────────────────────────
+
+def chat_health() -> dict:
+    """GET /chat/health — Check if chatbot is configured."""
+    r = httpx.get(f"{BASE_URL}/chat/health", headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def chat_send_message(message: str, patient_context: str = "") -> dict:
+    """POST /chat/message — Send message. Server remembers conversation."""
+    payload = {"message": message}
+    if patient_context:
+        payload["patient_context"] = patient_context
+    r = httpx.post(
+        f"{BASE_URL}/chat/message",
+        json=payload,
+        headers=_headers(),
+        timeout=60.0,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def chat_clear() -> dict:
+    """POST /chat/clear — Clear conversation thread on server."""
+    r = httpx.post(f"{BASE_URL}/chat/clear", headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()

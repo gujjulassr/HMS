@@ -1,12 +1,14 @@
 """
-Appointment Routes — book, cancel, and list appointments.
+Appointment Routes — book, cancel, reassign, and list appointments.
 
-Patient-facing endpoints. Mounted at: /api/appointments
+Patient-facing and staff-facing endpoints. Mounted at: /api/appointments
 """
+import logging
+
 from uuid import UUID
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -29,6 +31,7 @@ from api.schemas.appointment_schemas import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ─── Helper ───────────────────────────────────────────────────
@@ -491,9 +494,6 @@ async def undo_cancel_route(
     Undo a cancellation: move appointment from cancelled → booked.
     The risk penalty that was applied is reversed (subtracted back).
     """
-    import logging
-    logger = logging.getLogger(__name__)
-
     appt = await AppointmentModel.get_by_id(db, UUID(body.appointment_id))
     if not appt:
         raise HTTPException(status_code=404, detail="Appointment not found")
@@ -544,59 +544,89 @@ async def undo_cancel_route(
 
 @router.post("/reassign")
 async def reassign_appointment(
-    body: dict,
+    request: Request,
     user: User = Depends(require_role("nurse", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Reassign a booked/checked_in appointment to a different doctor's session.
-    The nurse picks the target session + slot. The patient keeps their status.
+    Reassign a booked/checked_in appointment to a different session or time slot.
+    Supports same-doctor time changes and cross-doctor reassignments.
     """
     from sqlalchemy import text as sql_text
 
-    appt_id = UUID(body["appointment_id"])
-    target_session_id = UUID(body["target_session_id"])
-    target_slot = body["target_slot_number"]
+    # Parse request body
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
-    appt = await AppointmentModel.get_by_id(db, appt_id)
-    if not appt:
-        raise HTTPException(status_code=404, detail="Appointment not found")
-    if appt.status not in ("booked", "checked_in"):
-        raise HTTPException(status_code=400, detail=f"Cannot reassign: status is '{appt.status}'")
+    try:
+        appt_id = UUID(str(body["appointment_id"]))
+        target_session_id = UUID(str(body["target_session_id"]))
+        target_slot = int(body["target_slot_number"])
+    except (KeyError, ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=f"Missing or invalid field: {e}")
 
-    # Validate target session
-    target_session = await SessionModel.get_by_id_for_update(db, target_session_id)
-    if not target_session:
-        raise HTTPException(status_code=404, detail="Target session not found")
-    if target_session.status != "active":
-        raise HTTPException(status_code=400, detail=f"Target session is {target_session.status}")
-    if target_slot < 1 or target_slot > target_session.total_slots:
-        raise HTTPException(status_code=400, detail=f"Invalid slot. Must be 1-{target_session.total_slots}")
+    logger.info(f"Reassign requested: appt={appt_id} -> session={target_session_id}, slot={target_slot}")
 
-    # Check slot availability
-    slot_pos = await AppointmentModel.get_next_slot_position(db, target_session_id, target_slot)
-    if slot_pos is None:
-        raise HTTPException(status_code=409, detail="Target slot is full")
+    try:
+        # Validate appointment exists and is reassignable
+        appt = await AppointmentModel.get_by_id(db, appt_id)
+        if not appt:
+            raise HTTPException(status_code=404, detail="Appointment not found")
+        if appt.status not in ("booked", "checked_in"):
+            raise HTTPException(status_code=400, detail=f"Cannot reassign: status is '{appt.status}'")
 
-    old_session_id = appt.session_id
+        # Validate target session is active and slot is in range
+        target_session = await SessionModel.get_by_id(db, target_session_id)
+        if not target_session:
+            raise HTTPException(status_code=404, detail="Target session not found")
+        if target_session.status != "active":
+            raise HTTPException(status_code=400, detail=f"Target session is '{target_session.status}', must be 'active'")
+        if target_slot < 1 or target_slot > target_session.total_slots:
+            raise HTTPException(status_code=400, detail=f"Slot {target_slot} invalid. Range: 1-{target_session.total_slots}")
 
-    # Move the appointment
-    await db.execute(
-        sql_text("""
-            UPDATE appointments
-            SET session_id = :new_sid, slot_number = :new_slot, slot_position = :new_pos
-            WHERE id = :id
-        """),
-        {"new_sid": target_session_id, "new_slot": target_slot, "new_pos": slot_pos, "id": appt_id},
-    )
+        # Check slot availability (position 1 or 2; 3 reserved for emergency)
+        slot_pos = await AppointmentModel.get_next_slot_position(db, target_session_id, target_slot)
+        if slot_pos is None:
+            raise HTTPException(status_code=409, detail="Target slot is full")
 
-    # Update booked counts
-    await SessionModel.update_booked_count(db, old_session_id, delta=-1)
-    await SessionModel.update_booked_count(db, target_session_id, delta=1)
+        old_session_id = appt.session_id
 
-    await db.commit()
+        # Move appointment to new session/slot — pass native Python types (asyncpg requirement)
+        await db.execute(
+            sql_text(
+                "UPDATE appointments "
+                "SET session_id = :new_sid, slot_number = :new_slot, slot_position = :new_pos "
+                "WHERE id = :id"
+            ),
+            {"new_sid": target_session_id, "new_slot": target_slot, "new_pos": slot_pos, "id": appt_id},
+        )
 
-    # Audit
+        # Adjust booked counts if moving between different sessions
+        if old_session_id != target_session_id:
+            await db.execute(
+                sql_text("UPDATE sessions SET booked_count = booked_count - 1 WHERE id = :id"),
+                {"id": old_session_id},
+            )
+            await db.execute(
+                sql_text("UPDATE sessions SET booked_count = booked_count + 1 WHERE id = :id"),
+                {"id": target_session_id},
+            )
+
+        await db.commit()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Reassign failed: {type(e).__name__}: {e}", exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Reassign error: {type(e).__name__}: {e}")
+
+    # ── Best-effort audit ──
     try:
         await AuditModel.create(
             db, action="book", performed_by_user_id=user.id,
@@ -608,17 +638,23 @@ async def reassign_appointment(
         )
         await db.commit()
     except Exception:
-        try: await db.rollback()
-        except Exception: pass
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
-    # Get target doctor name
-    doctor = await DoctorModel.get_by_id(db, target_session.doctor_id)
+    # ── Get doctor name (best-effort) ──
     doc_name = "another doctor"
-    if doctor:
-        doc_user = await UserModel.get_by_id(db, doctor.user_id)
-        if doc_user:
-            doc_name = doc_user.full_name
+    try:
+        doctor = await DoctorModel.get_by_id(db, target_session.doctor_id)
+        if doctor:
+            doc_user = await UserModel.get_by_id(db, doctor.user_id)
+            if doc_user:
+                doc_name = doc_user.full_name
+    except Exception:
+        pass
 
+    logger.info(f"Reassign complete: appt {appt_id} -> {doc_name}, slot {target_slot}")
     return {
         "status": "reassigned",
         "message": f"Appointment reassigned to {doc_name}, slot {target_slot}.",

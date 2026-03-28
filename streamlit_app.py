@@ -49,6 +49,99 @@ def _fetch_sessions_for_doctor(doctor_id: str, from_date: str = "", to_date: str
         return []
 
 
+def _db_get_sessions_by_doctor_id(doctor_id: str, date_str: str) -> list[dict]:
+    """
+    Direct DB query — fetches ALL sessions (any status) for a doctor on a date.
+    If no sessions exist for that date, auto-creates morning + afternoon as 'inactive'.
+    Uses doctor_id (not user_id) — for nurse/admin pickers.
+    """
+    import psycopg2
+    import psycopg2.extras
+    import uuid as _uuid_mod
+    try:
+        conn = psycopg2.connect(
+            host="localhost", port=5432, dbname="dpms_v2",
+            user="postgres", password="postgres",
+        )
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Fetch existing sessions for this doctor on this date
+        cur.execute("""
+            SELECT s.id as session_id, s.doctor_id, s.session_date,
+                   s.start_time, s.end_time, s.slot_duration_minutes,
+                   s.max_patients_per_slot, s.total_slots, s.booked_count,
+                   s.delay_minutes, s.status, s.notes
+            FROM sessions s
+            WHERE s.doctor_id = %s AND s.session_date = %s
+            ORDER BY s.start_time
+        """, (doctor_id, date_str))
+        rows = cur.fetchall()
+
+        existing_starts = set()
+        for r in rows:
+            existing_starts.add(str(r["start_time"])[:5])
+
+        # Auto-create missing standard sessions as 'inactive'
+        standard_sessions = [
+            {"start": "09:00", "end": "13:00", "slots": 16, "dur": 15, "max_pp": 2},
+            {"start": "14:00", "end": "17:00", "slots": 12, "dur": 15, "max_pp": 2},
+        ]
+
+        created = False
+        for ss in standard_sessions:
+            if ss["start"] not in existing_starts:
+                new_id = str(_uuid_mod.uuid4())
+                try:
+                    cur.execute("""
+                        INSERT INTO sessions (id, doctor_id, session_date, start_time, end_time,
+                            slot_duration_minutes, max_patients_per_slot, scheduling_type,
+                            total_slots, booked_count, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'TIME_SLOT', %s, 0, 'inactive')
+                    """, (new_id, doctor_id, date_str, ss["start"], ss["end"],
+                          ss["dur"], ss["max_pp"], ss["slots"]))
+                    created = True
+                except Exception:
+                    conn.rollback()
+
+        if created:
+            conn.commit()
+            cur.execute("""
+                SELECT s.id as session_id, s.doctor_id, s.session_date,
+                       s.start_time, s.end_time, s.slot_duration_minutes,
+                       s.max_patients_per_slot, s.total_slots, s.booked_count,
+                       s.delay_minutes, s.status, s.notes
+                FROM sessions s
+                WHERE s.doctor_id = %s AND s.session_date = %s
+                ORDER BY s.start_time
+            """, (doctor_id, date_str))
+            rows = cur.fetchall()
+
+        cur.close()
+        conn.close()
+        results = []
+        for r in rows:
+            results.append({
+                "session_id": str(r["session_id"]),
+                "doctor_id": str(r["doctor_id"]),
+                "session_date": str(r["session_date"]),
+                "start_time": str(r["start_time"]),
+                "end_time": str(r["end_time"]),
+                "slot_duration_minutes": r["slot_duration_minutes"],
+                "max_patients_per_slot": r["max_patients_per_slot"],
+                "total_slots": r["total_slots"],
+                "booked_count": r["booked_count"] or 0,
+                "delay_minutes": int(r["delay_minutes"] or 0),
+                "status": r["status"],
+            })
+        return results
+    except Exception as e:
+        # Fallback to API if DB connection fails
+        try:
+            return _fetch_sessions_for_doctor(doctor_id, from_date=date_str, to_date=date_str)
+        except Exception:
+            return []
+
+
 def _db_get_all_sessions_for_doctor(user_id: str, date_str: str) -> list[dict]:
     """
     Direct DB query — fetches ALL sessions (any status) for a doctor on a date.
@@ -251,27 +344,64 @@ def _smart_session_picker(key: str) -> str | None:
     date_choice = st.selectbox("📅 Date", list(date_options.keys()), key=f"date_{key}")
     from_d, to_d = date_options[date_choice]
 
-    sessions = _fetch_sessions_for_doctor(
-        chosen_doc["doctor_id"],
-        from_date=str(from_d) if from_d else "",
-        to_date=str(to_d) if to_d else "",
-    )
-    active_sessions = [s for s in sessions if s["status"] == "active"]
+    # For single-day picks (Today/Tomorrow), use DB function that auto-creates sessions
+    if from_d and from_d == to_d:
+        sessions = _db_get_sessions_by_doctor_id(
+            str(chosen_doc["doctor_id"]), str(from_d)
+        )
+    else:
+        # Multi-day range — use API
+        sessions = _fetch_sessions_for_doctor(
+            chosen_doc["doctor_id"],
+            from_date=str(from_d) if from_d else "",
+            to_date=str(to_d) if to_d else "",
+        )
 
-    if not active_sessions:
-        st.info(f"No active sessions for {chosen_doc['full_name']} on {date_choice.lower()}.")
+    # Show all sessions (active, inactive, completed) — not just active
+    usable_sessions = [s for s in sessions if s["status"] in ("active", "inactive", "completed")]
+
+    if not usable_sessions:
+        st.info(f"No sessions found for {chosen_doc['full_name']} on {date_choice.lower()}.")
         return None
 
-    # Step 4: Session (time) picker — show clear time labels
-    sess_labels = [
-        f"{s['session_date']}  •  {s['start_time'][:5]} – {s['end_time'][:5]}  •  {s['booked_count']}/{s['total_slots']} booked"
-        for s in active_sessions
-    ]
-    if len(active_sessions) == 1:
+    # Step 4: Session (time) picker — show status in label
+    def _sess_label(s):
+        status_tag = ""
+        if s["status"] == "inactive":
+            status_tag = " ⚪ INACTIVE"
+        elif s["status"] == "completed":
+            status_tag = " ✔️ COMPLETED"
+        return (f"{s['session_date']}  •  {s['start_time'][:5]} – {s['end_time'][:5]}  •  "
+                f"{s['booked_count']}/{s['total_slots']} booked{status_tag}")
+
+    sess_labels = [_sess_label(s) for s in usable_sessions]
+    if len(usable_sessions) == 1:
+        chosen_sess = usable_sessions[0]
+    else:
+        sess_idx = st.selectbox("🕐 Session", range(len(sess_labels)),
+                                format_func=lambda i: sess_labels[i], key=f"sess_{key}")
+        chosen_sess = usable_sessions[sess_idx]
+
+    # If session is inactive, show activate button
+    if chosen_sess["status"] == "inactive":
+        st.warning(f"⚪ This session is **inactive**. Activate it to manage patients.")
+        if st.button("🟢 Activate Session", type="primary", use_container_width=True, key=f"activate_{key}"):
+            try:
+                r = api.activate_session({"session_id": chosen_sess["session_id"]})
+                st.success(r.get("message", "Session activated!"))
+                # Clear cached sessions so it reloads
+                st.session_state.pop("today_sessions", None)
+                import time as _t; _t.sleep(0.5)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to activate: {e}")
+        return None  # Don't load queue until activated
+
+    # Show session info
+    if len(usable_sessions) == 1:
         st.caption(f"📍 Session: **{sess_labels[0]}**")
-        return active_sessions[0]["session_id"]
-    sess_idx = st.selectbox("🕐 Session", range(len(sess_labels)), format_func=lambda i: sess_labels[i], key=f"sess_{key}")
-    return active_sessions[sess_idx]["session_id"]
+
+    return chosen_sess["session_id"]
 
 
 def _time_to_minutes_safe(q: dict) -> int:
@@ -365,11 +495,14 @@ def show_sidebar():
 
         menus = {
             "patient": {"dashboard": "🏠 Dashboard", "book": "📅 Book Appointment",
-                        "my_appointments": "📋 My Appointments", "profile": "👤 My Profile"},
+                        "my_appointments": "📋 My Appointments", "profile": "👤 My Profile",
+                        "chatbot": "🤖 AI Assistant"},
             "doctor": {"dashboard": "🏠 Dashboard", "doctor_queue": "📋 My Queue",
-                       "doctor_session": "⚙️ Session Controls"},
+                       "doctor_session": "⚙️ Session Controls",
+                       "chatbot": "🤖 AI Assistant"},
             "nurse": {"dashboard": "🏠 Dashboard", "staff_session": "📋 Session & Queue",
-                      "nurse_emergency": "🚨 Emergency Book"},
+                      "nurse_emergency": "🚨 Emergency Book",
+                      "chatbot": "🤖 AI Assistant"},
             "admin": {
                 "admin_home": "🏠 Dashboard",
                 "admin_users": "👥 Users",
@@ -381,6 +514,7 @@ def show_sidebar():
                 "staff_session": "📋 Session & Queue",
                 "nurse_emergency": "🚨 Emergency Book",
                 "admin_cancel": "❌ Cancel Session",
+                "chatbot": "🤖 AI Assistant",
             },
         }
         for key, label in menus.get(role, {"dashboard": "🏠 Dashboard"}).items():
@@ -3335,6 +3469,334 @@ def page_admin_cancel():
 
 
 # ════════════════════════════════════════════════════════════
+# AI CHATBOT
+# ════════════════════════════════════════════════════════════
+
+def page_chatbot():
+    """AI Chatbot — clean two-mode interface."""
+    st.title("🤖 AI Assistant")
+
+    user = st.session_state.user
+    role = user["role"]
+
+    # ── Check if chatbot is configured ──
+    try:
+        health = api.chat_health()
+        if health.get("status") != "ready":
+            st.warning("AI Chatbot is not configured. Ask your administrator to set the OPENAI_API_KEY.")
+            return
+    except Exception:
+        st.warning("Could not reach chatbot service. Make sure the backend is running.")
+        return
+
+    # ── Init session state for chat ──
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+    if "chat_form_done" not in st.session_state:
+        st.session_state.chat_form_done = False
+    if "chat_patient_context" not in st.session_state:
+        st.session_state.chat_patient_context = ""
+    if "chat_mode" not in st.session_state:
+        st.session_state.chat_mode = ""  # "", "book", "chat"
+
+    # ── MODE SELECTION (nurse/admin only) ──
+    if role in ("nurse", "admin") and st.session_state.chat_mode == "":
+        _show_mode_selection(role)
+        return
+
+    # ── BOOKING FORM (nurse/admin chose "book") ──
+    if st.session_state.chat_mode == "book" and not st.session_state.chat_form_done:
+        if role == "nurse":
+            _show_nurse_intake_form()
+        elif role == "admin":
+            _show_admin_intake_form()
+        return
+
+    # ── For patient/doctor: skip mode selection, go straight to chat ──
+    if role in ("patient", "doctor") and not st.session_state.chat_form_done:
+        # Auto-mark as done — they go straight to chat
+        st.session_state.chat_form_done = True
+        st.session_state.chat_mode = "chat"
+        greeting = f"Hello {user['full_name']}! I'm your AI assistant. How can I help you today?"
+        st.session_state.chat_messages = [{"role": "assistant", "content": greeting}]
+        st.rerun()
+        return
+
+    # ── Chat interface ──
+    _show_chat_interface()
+
+
+def _show_mode_selection(role: str):
+    """Show two clean buttons: Book Patient or Just Chat."""
+    user = st.session_state.user
+    st.markdown(f"**Welcome, {user['full_name']}!** ({role.title()})")
+    st.markdown("---")
+    st.markdown("#### What would you like to do?")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(
+            '<div style="background:#e8f5e9;border-radius:12px;padding:20px;text-align:center;">'
+            '<h3 style="margin:0;">📋 Book a Patient</h3>'
+            '<p style="color:#555;margin:8px 0 0;">Fill the patient form first,<br>then chat to complete the booking</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("📋 Book a Patient", use_container_width=True, key="mode_book"):
+            st.session_state.chat_mode = "book"
+            st.rerun()
+    with col2:
+        st.markdown(
+            '<div style="background:#e3f2fd;border-radius:12px;padding:20px;text-align:center;">'
+            '<h3 style="margin:0;">💬 Just Chat</h3>'
+            '<p style="color:#555;margin:8px 0 0;">View ops board, manage queue,<br>check-in, reassign, sessions, etc.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("💬 Just Chat", use_container_width=True, key="mode_chat"):
+            st.session_state.chat_mode = "chat"
+            st.session_state.chat_form_done = True
+            greeting = f"Hello {user['full_name']}! I'm your AI assistant. How can I help you today?"
+            st.session_state.chat_messages = [{"role": "assistant", "content": greeting}]
+            st.rerun()
+
+
+def _get_dept_list():
+    """Helper: fetch departments for dropdowns."""
+    try:
+        depts = api.list_departments()
+        if isinstance(depts, list) and depts:
+            if isinstance(depts[0], dict):
+                return [d.get("specialization", d.get("name", "")) for d in depts]
+            return depts
+    except Exception:
+        pass
+    return []
+
+
+
+def _show_nurse_intake_form():
+    """Nurse intake: collect patient details for booking. Clean and focused."""
+    st.markdown("### 📋 Patient Booking Form")
+    if st.button("← Back", key="nurse_form_back"):
+        st.session_state.chat_mode = ""
+        st.rerun()
+
+    st.caption("Fill in the patient details. The AI will use this data to book directly.")
+    user = st.session_state.user
+    departments = _get_dept_list()
+
+    with st.form("nurse_intake_form"):
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            pat_name = st.text_input("Patient Full Name *", placeholder="e.g. Simha Kumar")
+            pat_phone = st.text_input("Phone Number *", placeholder="e.g. 9876543210")
+            pat_uhid = st.text_input("UHID / ABHA ID", placeholder="e.g. 14-digit ABHA number")
+            pat_gender = st.selectbox("Gender", ["male", "female", "other"])
+        with pc2:
+            pat_dob = st.date_input("Date of Birth", value=None, min_value=__import__("datetime").date(1920, 1, 1))
+            pat_blood = st.selectbox("Blood Group", ["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"])
+            preferred_dept = st.selectbox("Department *", ["Not sure"] + departments)
+            urgency = st.selectbox("Urgency", ["routine", "soon", "urgent"])
+
+        symptoms = st.text_area("Symptoms / Reason for Visit",
+                                 placeholder="e.g. Chest pain since morning, mild fever...",
+                                 height=80)
+        additional = st.text_input("Additional Notes (optional)",
+                                    placeholder="e.g. Allergic to aspirin, needs wheelchair access...")
+
+        is_walkin = st.checkbox("New walk-in patient (not yet registered)")
+        is_emergency = st.checkbox("Emergency booking")
+
+        submitted = st.form_submit_button("🚀 Enter Chat & Book", use_container_width=True, type="primary")
+
+    if submitted:
+        if not pat_name or len(pat_name.strip()) < 2:
+            st.error("Patient name is required.")
+            return
+
+        # Determine task from checkboxes
+        if is_emergency:
+            task = "Emergency booking"
+        elif is_walkin:
+            task = "Register new walk-in patient and book"
+        else:
+            task = "Book appointment for existing patient"
+
+        dept_text = preferred_dept if preferred_dept != "Not sure" else "not specified"
+        ctx_parts = [f"Staff (Nurse): {user['full_name']}", f"Task: {task}"]
+        ctx_parts.append(f"Patient Name: {pat_name.strip()}")
+        if pat_phone:
+            ctx_parts.append(f"Patient Phone: {pat_phone.strip()}")
+        if pat_uhid:
+            ctx_parts.append(f"Patient UHID/ABHA: {pat_uhid.strip()}")
+        ctx_parts.append(f"Patient Gender: {pat_gender}")
+        if pat_dob:
+            ctx_parts.append(f"Patient DOB: {str(pat_dob)}")
+        if pat_blood:
+            ctx_parts.append(f"Blood Group: {pat_blood}")
+        if dept_text != "not specified":
+            ctx_parts.append(f"Preferred Department: {dept_text}")
+        ctx_parts.append(f"Urgency: {urgency}")
+        if symptoms:
+            ctx_parts.append(f"Symptoms: {symptoms.strip()}")
+        if additional:
+            ctx_parts.append(f"Notes: {additional.strip()}")
+        st.session_state.chat_patient_context = "\n".join(ctx_parts)
+        st.session_state.chat_form_done = True
+
+        # Compact greeting
+        greeting = f"Hello {user['full_name']}! I have the patient details.\n\n"
+        greeting += f"**{task}**\n"
+        greeting += f"**Patient:** {pat_name.strip()}"
+        if pat_phone:
+            greeting += f" | {pat_phone.strip()}"
+        greeting += f"\n**Dept:** {dept_text} | **Urgency:** {urgency}\n\n"
+        greeting += "I'll start looking for available doctors and slots now. Say **proceed** or tell me what to do."
+
+        st.session_state.chat_messages = [{"role": "assistant", "content": greeting}]
+        st.rerun()
+
+
+def _show_admin_intake_form():
+    """Admin intake: patient details for booking. Same form as nurse."""
+    st.markdown("### 📋 Patient Booking Form (Admin)")
+    if st.button("← Back", key="admin_form_back"):
+        st.session_state.chat_mode = ""
+        st.rerun()
+
+    st.caption("Fill in the patient details. The AI will use this data to book directly.")
+    user = st.session_state.user
+    departments = _get_dept_list()
+
+    with st.form("admin_intake_form"):
+        ac1, ac2 = st.columns(2)
+        with ac1:
+            pat_name = st.text_input("Patient Name *", placeholder="e.g. Ravi Kumar", key="admin_pat_name")
+            pat_phone = st.text_input("Phone *", placeholder="e.g. 9876543210", key="admin_pat_phone")
+            pat_uhid = st.text_input("UHID / ABHA ID", placeholder="e.g. 14-digit ABHA", key="admin_pat_uhid")
+            pat_gender = st.selectbox("Gender", ["male", "female", "other"], key="admin_pat_gender")
+        with ac2:
+            pat_dob = st.date_input("Date of Birth", value=None, min_value=__import__("datetime").date(1920, 1, 1), key="admin_pat_dob")
+            pat_blood = st.selectbox("Blood Group", ["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"], key="admin_pat_blood")
+            preferred_dept = st.selectbox("Department *", ["Not sure"] + departments, key="admin_dept")
+            urgency = st.selectbox("Urgency", ["routine", "soon", "urgent"], key="admin_urgency")
+
+        symptoms = st.text_area("Symptoms / Reason for Visit", placeholder="e.g. Fever, headache...", height=80, key="admin_symptoms")
+
+        is_walkin = st.checkbox("New walk-in patient (not yet registered)", key="admin_walkin")
+        is_emergency = st.checkbox("Emergency booking", key="admin_emergency")
+
+        submitted = st.form_submit_button("🚀 Enter Chat & Book", use_container_width=True, type="primary")
+
+    if submitted:
+        if not pat_name or len(pat_name.strip()) < 2:
+            st.error("Patient name is required.")
+            return
+
+        if is_emergency:
+            task = "Emergency booking"
+        elif is_walkin:
+            task = "Register new walk-in patient and book"
+        else:
+            task = "Book appointment for existing patient"
+
+        dept_text = preferred_dept if preferred_dept != "Not sure" else "not specified"
+        ctx_parts = [f"Admin: {user['full_name']}", f"Task: {task}"]
+        ctx_parts.append(f"Patient Name: {pat_name.strip()}")
+        if pat_phone:
+            ctx_parts.append(f"Patient Phone: {pat_phone.strip()}")
+        if pat_uhid:
+            ctx_parts.append(f"Patient UHID/ABHA: {pat_uhid.strip()}")
+        ctx_parts.append(f"Patient Gender: {pat_gender}")
+        if pat_dob:
+            ctx_parts.append(f"Patient DOB: {str(pat_dob)}")
+        if pat_blood:
+            ctx_parts.append(f"Blood Group: {pat_blood}")
+        if dept_text != "not specified":
+            ctx_parts.append(f"Preferred Department: {dept_text}")
+        ctx_parts.append(f"Urgency: {urgency}")
+        if symptoms:
+            ctx_parts.append(f"Symptoms: {symptoms.strip()}")
+        st.session_state.chat_patient_context = "\n".join(ctx_parts)
+        st.session_state.chat_form_done = True
+
+        greeting = f"Hello {user['full_name']}! I have the patient details.\n\n"
+        greeting += f"**{task}**\n"
+        greeting += f"**Patient:** {pat_name.strip()}"
+        if pat_phone:
+            greeting += f" | {pat_phone.strip()}"
+        greeting += f"\n**Dept:** {dept_text} | **Urgency:** {urgency}\n\n"
+        greeting += "I'll start looking for available doctors and slots now. Say **proceed** or tell me what to do."
+
+        st.session_state.chat_messages = [{"role": "assistant", "content": greeting}]
+        st.rerun()
+
+
+def _show_chat_interface():
+    """Chat interface — shown after the intake form is filled or in direct-chat mode."""
+    user = st.session_state.user
+    role = user["role"]
+
+    # Toolbar
+    col1, col2, col3 = st.columns([6, 2, 2])
+    with col1:
+        mode_label = "Booking" if st.session_state.chat_mode == "book" else "Chat"
+        st.caption(f"Chatting as **{user['full_name']}** ({role.upper()}) — {mode_label} mode")
+    with col2:
+        if st.button("🔄 New Chat", use_container_width=True):
+            # Clear server-side conversation memory
+            try:
+                api.chat_clear()
+            except Exception:
+                pass
+            st.session_state.chat_messages = []
+            st.session_state.chat_form_done = False
+            st.session_state.chat_patient_context = ""
+            st.session_state.chat_mode = ""
+            st.session_state.chat_context_sent = False
+            st.rerun()
+    with col3:
+        if st.session_state.chat_mode == "book" and role in ("nurse", "admin"):
+            if st.button("📋 Edit Form", use_container_width=True):
+                st.session_state.chat_form_done = False
+                st.rerun()
+
+    st.divider()
+
+    # Display message history (local UI copy)
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Chat input
+    if prompt := st.chat_input("Type your message..."):
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    # Only send patient_context on the FIRST message (server stores it)
+                    ctx = ""
+                    if not st.session_state.get("chat_context_sent"):
+                        ctx = st.session_state.chat_patient_context
+                        st.session_state.chat_context_sent = True
+
+                    response = api.chat_send_message(
+                        message=prompt,
+                        patient_context=ctx,
+                    )
+                    reply = response.get("reply", "Sorry, I couldn't process that.")
+                except Exception as e:
+                    reply = f"Error communicating with AI: {e}"
+
+                st.markdown(reply)
+                st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+
+
+# ════════════════════════════════════════════════════════════
 # DASHBOARD ROUTER
 # ════════════════════════════════════════════════════════════
 
@@ -3368,6 +3830,7 @@ PAGE_MAP = {
     "admin_config": page_admin_config,
     "admin_audit": page_admin_audit,
     "admin_cancel": page_admin_cancel,
+    "chatbot": page_chatbot,
 }
 
 

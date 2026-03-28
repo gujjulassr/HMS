@@ -643,7 +643,7 @@ async def complete_session_route(
 @router.post("/activate")
 async def activate_session(
     body: CompleteSessionRequest,  # reuse: has session_id + optional note
-    user: User = Depends(require_role("doctor", "admin")),
+    user: User = Depends(require_role("doctor", "nurse", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
     """Doctor activates an inactive session so patients can be seen."""
@@ -678,7 +678,7 @@ async def activate_session(
 @router.post("/deactivate")
 async def deactivate_session(
     body: CompleteSessionRequest,  # reuse: has session_id + optional note
-    user: User = Depends(require_role("doctor", "admin")),
+    user: User = Depends(require_role("doctor", "nurse", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
     """Doctor deactivates a session. Fails if any patient is currently in_progress."""

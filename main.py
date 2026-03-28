@@ -15,6 +15,7 @@ from api.routes.appointment import router as appointment_router
 from api.routes.session_mgmt import router as session_mgmt_router
 from api.routes.queue import router as queue_router
 from api.routes.admin import router as admin_router
+from api.routes.chat import router as chat_router
 
 
 # ─── Lifespan: startup + shutdown events ─────────────────────
@@ -67,3 +68,5 @@ app.include_router(session_mgmt_router, prefix="/api/sessions", tags=["Session M
 app.include_router(queue_router, prefix="/api/queue", tags=["Queue"])
 
 app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
+
+app.include_router(chat_router, prefix="/api/chat", tags=["Chat"])
