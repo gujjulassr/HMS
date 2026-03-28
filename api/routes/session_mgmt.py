@@ -105,7 +105,8 @@ async def _get_remaining_appointments(db: AsyncSession, session_id: UUID) -> lis
         """),
         {"sid": session_id},
     )
-    return [Appointment(**row) for row in result.mappings().all()]
+    from lo.models.appointment import _safe_appointment
+    return [_safe_appointment(row) for row in result.mappings().all()]
 
 
 async def _notify_patients_delay(
@@ -513,6 +514,25 @@ async def complete_session_route(
             detail="Cannot complete session — a patient is currently in progress. Finish them first.",
         )
 
+    # Get patients who will be affected — for notifications
+    booked_appts = await db.execute(
+        sql_text(
+            "SELECT a.id, a.patient_id FROM appointments a "
+            "WHERE a.session_id = :sid AND a.status = 'booked'"
+        ),
+        {"sid": UUID(body.session_id)},
+    )
+    booked_rows = booked_appts.mappings().all()
+
+    checked_in_appts = await db.execute(
+        sql_text(
+            "SELECT a.id, a.patient_id FROM appointments a "
+            "WHERE a.session_id = :sid AND a.status = 'checked_in'"
+        ),
+        {"sid": UUID(body.session_id)},
+    )
+    checked_in_rows = checked_in_appts.mappings().all()
+
     # Mark remaining booked patients as no_show (never showed up)
     no_show_result = await db.execute(
         sql_text(
@@ -523,7 +543,20 @@ async def complete_session_route(
     )
     no_show_count = no_show_result.rowcount
 
-    # Mark checked_in patients as cancelled (showed up but couldn't be seen)
+    # Apply risk penalty for no-shows (+0.5 per no-show)
+    for row in booked_rows:
+        try:
+            await db.execute(
+                sql_text(
+                    "UPDATE patients SET risk_score = LEAST(risk_score + 0.5, 10.0) "
+                    "WHERE id = :pid"
+                ),
+                {"pid": row["patient_id"]},
+            )
+        except Exception:
+            pass
+
+    # Mark checked_in patients as cancelled (showed up but couldn't be seen — no penalty)
     cancelled_result = await db.execute(
         sql_text(
             "UPDATE appointments SET status = 'cancelled' "
@@ -538,9 +571,41 @@ async def complete_session_route(
     if not success:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to complete session")
 
+    # Commit core changes first (no_show, cancelled, session completed)
     await db.commit()
 
-    # Audit
+    # Best-effort notifications (post-commit, so failures don't rollback the session)
+    for row in booked_rows:
+        try:
+            patient = await PatientModel.get_by_id(db, row["patient_id"])
+            if patient:
+                await NotificationModel.create(
+                    db, user_id=patient.user_id,
+                    type="reminder", channel="push",
+                    content="You were marked as no-show. Risk score increased. Please rebook.",
+                    appointment_id=row["id"],
+                )
+            await db.commit()
+        except Exception:
+            try: await db.rollback()
+            except Exception: pass
+
+    for row in checked_in_rows:
+        try:
+            patient = await PatientModel.get_by_id(db, row["patient_id"])
+            if patient:
+                await NotificationModel.create(
+                    db, user_id=patient.user_id,
+                    type="cancellation", channel="push",
+                    content="Session ended before you could be seen. Please rebook. No penalty applied.",
+                    appointment_id=row["id"],
+                )
+            await db.commit()
+        except Exception:
+            try: await db.rollback()
+            except Exception: pass
+
+    # Best-effort audit log
     try:
         await AuditModel.create(
             db, action="complete_session", performed_by_user_id=user.id,
@@ -681,6 +746,7 @@ async def cancel_session_route(
         return CancelSessionResponse(
             status=result["status"], message=result["message"],
             appointments_cancelled=result["appointments_cancelled"],
+            no_show_count=result.get("no_show_count", 0),
             waitlist_cancelled=result["waitlist_cancelled"],
         )
     except ValueError as e:

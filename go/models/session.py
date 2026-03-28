@@ -261,7 +261,7 @@ class SessionModel:
     @staticmethod
     async def cancel_session(db: AsyncSession, session_id: UUID) -> bool:
         result = await db.execute(
-            text("UPDATE sessions SET status = 'cancelled' WHERE id = :id AND status = 'active'"),
+            text("UPDATE sessions SET status = 'cancelled' WHERE id = :id AND status IN ('active', 'inactive')"),
             {"id": session_id},
         )
         return result.rowcount > 0

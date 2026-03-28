@@ -370,8 +370,18 @@ def show_sidebar():
                        "doctor_session": "⚙️ Session Controls"},
             "nurse": {"dashboard": "🏠 Dashboard", "staff_session": "📋 Session & Queue",
                       "nurse_emergency": "🚨 Emergency Book"},
-            "admin": {"dashboard": "🏠 Dashboard", "staff_session": "📋 Session & Queue",
-                      "nurse_emergency": "🚨 Emergency Book", "admin_cancel": "❌ Cancel Session"},
+            "admin": {
+                "admin_home": "🏠 Dashboard",
+                "admin_users": "👥 Users",
+                "admin_doctors": "🩺 Doctors",
+                "admin_sessions_overview": "📅 Sessions",
+                "admin_patients": "🏥 Patients",
+                "admin_config": "⚙️ Config",
+                "admin_audit": "📜 Audit Logs",
+                "staff_session": "📋 Session & Queue",
+                "nurse_emergency": "🚨 Emergency Book",
+                "admin_cancel": "❌ Cancel Session",
+            },
         }
         for key, label in menus.get(role, {"dashboard": "🏠 Dashboard"}).items():
             if st.button(label, key=f"nav_{key}", use_container_width=True):
@@ -2712,6 +2722,589 @@ def page_nurse_emergency():
 # ADMIN: CANCEL SESSION
 # ════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════
+# ADMIN DASHBOARD — FULL SYSTEM CONTROL
+# ════════════════════════════════════════════════════════════
+
+def page_admin_dashboard():
+    """Admin overview — today's stats at a glance."""
+    st.title("🏠 Admin Dashboard")
+    try:
+        stats = api.admin_stats()
+    except Exception as e:
+        st.error(f"Failed to load stats: {e}")
+        return
+
+    # ── Top KPI row ──
+    k1, k2, k3, k4 = st.columns(4)
+    sess = stats.get("sessions", {})
+    appt = stats.get("appointments", {})
+    users = stats.get("users", {})
+
+    k1.metric("Sessions Today", sess.get("total", 0),
+              f"{sess.get('active', 0)} active")
+    k2.metric("Appointments", appt.get("total", 0),
+              f"{appt.get('completed', 0)} done")
+    k3.metric("Active Doctors", stats.get("active_doctors_today", 0))
+    k4.metric("High-Risk Patients", stats.get("high_risk_patients", 0))
+
+    st.divider()
+
+    # ── Sessions breakdown ──
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### Sessions")
+        for key in ["active", "inactive", "completed", "cancelled"]:
+            val = sess.get(key, 0)
+            colors = {"active": "🟢", "inactive": "🟡", "completed": "✅", "cancelled": "❌"}
+            st.write(f"{colors.get(key, '•')} **{key.title()}**: {val}")
+
+    with c2:
+        st.markdown("### Appointments")
+        for key in ["booked", "checked_in", "in_progress", "completed", "no_show", "cancelled", "emergencies"]:
+            val = appt.get(key, 0)
+            icons = {"booked": "📅", "checked_in": "✅", "in_progress": "🔄",
+                     "completed": "✔️", "no_show": "⚠️", "cancelled": "❌", "emergencies": "🚨"}
+            st.write(f"{icons.get(key, '•')} **{key.replace('_', ' ').title()}**: {val}")
+
+    st.divider()
+
+    # ── User summary ──
+    st.markdown("### System Users")
+    u1, u2, u3, u4, u5 = st.columns(5)
+    u1.metric("Total", users.get("total", 0))
+    u2.metric("Patients", users.get("patients", 0))
+    u3.metric("Doctors", users.get("doctors", 0))
+    u4.metric("Nurses", users.get("nurses", 0))
+    u5.metric("Admins", users.get("admins", 0))
+    if users.get("deactivated", 0) > 0:
+        st.caption(f"⚠️ {users['deactivated']} deactivated users")
+
+
+def page_admin_users():
+    """User management — create, view, activate/deactivate staff."""
+    st.title("👥 User Management")
+
+    # ── Persistent message ──
+    if st.session_state.get("admin_msg"):
+        st.success(st.session_state.pop("admin_msg"))
+
+    tab_list, tab_create = st.tabs(["📋 All Users", "➕ Create Staff"])
+
+    # ── TAB 1: List users ──
+    with tab_list:
+        fc1, fc2, fc3 = st.columns([2, 2, 1])
+        role_filter = fc1.selectbox("Filter by role",
+                                     ["all", "doctor", "nurse", "admin", "patient"],
+                                     key="admin_user_role")
+        # Department filter (only meaningful for doctors)
+        try:
+            depts = ["all"] + api.admin_list_departments()
+        except Exception:
+            depts = ["all"]
+        dept_filter = fc2.selectbox("Department", depts, key="admin_user_dept",
+                                     disabled=(role_filter not in ("all", "doctor")))
+        show_inactive = fc3.checkbox("Show inactive", key="admin_show_inactive")
+
+        try:
+            users = api.admin_list_users(
+                role="" if role_filter == "all" else role_filter,
+                include_inactive=show_inactive,
+            )
+        except Exception as e:
+            st.error(f"Failed: {e}")
+            return
+
+        # Client-side department filter: match doctor users against doctor list
+        if dept_filter != "all" and role_filter in ("all", "doctor"):
+            try:
+                dept_docs = api.admin_list_doctors(specialization=dept_filter)
+                dept_user_ids = {d["user_id"] for d in dept_docs}
+                users = [u for u in users if u["role"] != "doctor" or u["id"] in dept_user_ids]
+                if role_filter == "doctor":
+                    users = [u for u in users if u["id"] in dept_user_ids]
+            except Exception:
+                pass
+
+        if not users:
+            st.info("No users found.")
+            return
+
+        for u in users:
+            uid = str(u["id"])
+            active = str(u.get("is_active", "True")).lower() == "true"
+            role_icon = {"doctor": "🩺", "nurse": "💉", "admin": "🔧", "patient": "👤"}.get(u["role"], "•")
+            status_dot = "🟢" if active else "🔴"
+
+            with st.container(border=True):
+                uc1, uc2, uc3 = st.columns([4, 1, 1])
+                uc1.markdown(
+                    f"{status_dot} {role_icon} **{u['full_name']}**  "
+                    f"({u['role']})  •  {u.get('email', '—')}  •  📞 {u.get('phone') or '—'}"
+                )
+                uc2.caption(f"Since {str(u.get('created_at', ''))[:10]}")
+
+                # Toggle button
+                btn_label = "Deactivate" if active else "Activate"
+                if u["role"] != "admin" or uid != str(st.session_state.user.get("user_id")):
+                    if uc3.button(btn_label, key=f"toggle_{uid}", use_container_width=True):
+                        try:
+                            r = api.admin_toggle_user(uid)
+                            st.session_state["admin_msg"] = r["message"]
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"{e}")
+
+    # ── TAB 2: Create staff ──
+    with tab_create:
+        with st.form("create_staff_form"):
+            st.markdown("**New Staff Member**")
+            cs1, cs2 = st.columns(2)
+            cs_name = cs1.text_input("Full Name *", placeholder="Dr. Priya Sharma")
+            cs_email = cs2.text_input("Email *", placeholder="priya@hospital.com")
+
+            cs3, cs4, cs5 = st.columns(3)
+            cs_phone = cs3.text_input("Phone", placeholder="9876543210")
+            cs_password = cs4.text_input("Password *", type="password")
+            cs_role = cs5.selectbox("Role *", ["doctor", "nurse", "admin"])
+
+            # Doctor-specific fields
+            if cs_role == "doctor":
+                st.markdown("**Doctor Details**")
+                dc1, dc2 = st.columns(2)
+                dc_spec = dc1.text_input("Specialization *", placeholder="Cardiology")
+                dc_qual = dc2.text_input("Qualification *", placeholder="MBBS, MD")
+                dc3, dc4, dc5 = st.columns(3)
+                dc_license = dc3.text_input("License Number *", placeholder="MCI-12345")
+                dc_fee = dc4.number_input("Consultation Fee (₹)", 0, 10000, 500)
+                dc_max = dc5.number_input("Max Patients/Slot", 1, 10, 2)
+
+            if st.form_submit_button("✅ Create", type="primary", use_container_width=True):
+                if not cs_name or not cs_email or not cs_password:
+                    st.error("Name, email, and password are required.")
+                else:
+                    payload = {
+                        "full_name": cs_name.strip(),
+                        "email": cs_email.strip(),
+                        "phone": cs_phone.strip(),
+                        "password": cs_password,
+                        "role": cs_role,
+                    }
+                    if cs_role == "doctor":
+                        payload.update({
+                            "specialization": dc_spec.strip(),
+                            "qualification": dc_qual.strip(),
+                            "license_number": dc_license.strip(),
+                            "consultation_fee": dc_fee,
+                            "max_patients_per_slot": dc_max,
+                        })
+                    try:
+                        r = api.admin_create_user(payload)
+                        st.session_state["admin_msg"] = r["message"]
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
+
+
+def page_admin_doctors():
+    """Doctor management — view all, toggle availability, edit settings."""
+    st.title("🩺 Doctor Management")
+
+    if st.session_state.get("admin_msg"):
+        st.success(st.session_state.pop("admin_msg"))
+
+    # Department filter
+    try:
+        depts = ["All"] + api.admin_list_departments()
+    except Exception:
+        depts = ["All"]
+    dept_sel = st.selectbox("Filter by Department", depts, key="admin_doc_dept")
+
+    try:
+        doctors = api.admin_list_doctors(
+            specialization="" if dept_sel == "All" else dept_sel
+        )
+    except Exception as e:
+        st.error(f"Failed to load doctors: {e}")
+        return
+
+    if not doctors:
+        st.info("No doctors registered.")
+        return
+
+    # Group by department
+    by_dept = {}
+    for doc in doctors:
+        dept = doc.get("specialization") or "Other"
+        if dept not in by_dept:
+            by_dept[dept] = []
+        by_dept[dept].append(doc)
+
+    for dept in sorted(by_dept.keys()):
+        st.subheader(f"🏥 {dept}")
+        for doc in by_dept[dept]:
+            did = str(doc["doctor_id"])
+            avail = str(doc.get("is_available", "True")).lower() == "true"
+            user_active = str(doc.get("user_active", "True")).lower() == "true"
+            avail_badge = "🟢 Available" if avail else "🔴 Unavailable"
+            user_badge = "" if user_active else " *(deactivated)*"
+
+            try:
+                fee_val = int(float(doc.get("consultation_fee", 500)))
+            except (ValueError, TypeError):
+                fee_val = 500
+            try:
+                max_val = int(doc.get("max_patients_per_slot", 2))
+            except (ValueError, TypeError):
+                max_val = 2
+
+            with st.expander(f"{'🟢' if avail else '🔴'} {doc['full_name']} | {avail_badge}{user_badge}", expanded=False):
+                i1, i2 = st.columns(2)
+                i1.write(f"**Email**: {doc.get('email') or '—'}")
+                i1.write(f"**Phone**: {doc.get('phone') or '—'}")
+                i1.write(f"**Qualification**: {doc.get('qualification') or '—'}")
+                i2.write(f"**License**: {doc.get('license_number') or '—'}")
+                i2.write(f"**Fee**: ₹{fee_val}")
+                i2.write(f"**Max/Slot**: {max_val}")
+
+                st.divider()
+                ac1, ac2 = st.columns(2)
+
+                new_avail = not avail
+                avail_label = "Set Available" if new_avail else "Set Unavailable"
+                if ac1.button(avail_label, key=f"avail_{did}", use_container_width=True):
+                    try:
+                        api.admin_update_doctor(did, {"is_available": new_avail})
+                        st.session_state["admin_msg"] = f"{'Enabled' if new_avail else 'Disabled'} {doc['full_name']}"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"{e}")
+
+                with ac2.popover("✏️ Edit Settings"):
+                    ed_fee = st.number_input("Fee (₹)", 0, 10000, fee_val, key=f"ed_fee_{did}")
+                    ed_max = st.number_input("Max/Slot", 1, 10, max_val, key=f"ed_max_{did}")
+                    ed_spec = st.text_input("Specialization", doc.get("specialization") or "", key=f"ed_spec_{did}")
+                    if st.button("Save", key=f"ed_save_{did}", type="primary", use_container_width=True):
+                        updates = {}
+                        if ed_fee != fee_val:
+                            updates["consultation_fee"] = ed_fee
+                        if ed_max != max_val:
+                            updates["max_patients_per_slot"] = ed_max
+                        if ed_spec != (doc.get("specialization") or ""):
+                            updates["specialization"] = ed_spec
+                        if updates:
+                            try:
+                                api.admin_update_doctor(did, updates)
+                                st.session_state["admin_msg"] = f"Updated {doc['full_name']}"
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"{e}")
+                        else:
+                            st.info("No changes")
+
+
+def page_admin_config():
+    """System configuration — scheduling_config key-value store."""
+    st.title("⚙️ System Configuration")
+
+    if st.session_state.get("admin_msg"):
+        st.success(st.session_state.pop("admin_msg"))
+
+    try:
+        configs = api.admin_get_config()
+    except Exception as e:
+        st.error(f"Failed to load config: {e}")
+        return
+
+    if not configs:
+        st.info("No configuration entries found.")
+        return
+
+    for cfg in configs:
+        key = cfg["config_key"]
+        val = cfg["config_value"]
+        desc = cfg.get("description") or ""
+        updated = str(cfg.get("updated_at", ""))[:19]
+
+        with st.container(border=True):
+            cc1, cc2 = st.columns([3, 1])
+            cc1.markdown(f"**{key}**")
+            if desc:
+                cc1.caption(desc)
+            cc1.code(str(val), language=None)
+            cc1.caption(f"Last updated: {updated}")
+
+            with cc2.popover("✏️ Edit"):
+                # Determine input type based on current value
+                if isinstance(val, bool):
+                    new_val = st.checkbox("Value", value=val, key=f"cfg_{key}")
+                elif isinstance(val, (int, float)):
+                    new_val = st.number_input("Value", value=float(val), key=f"cfg_{key}")
+                else:
+                    new_val = st.text_input("Value", value=str(val), key=f"cfg_{key}")
+
+                if st.button("Save", key=f"cfg_save_{key}", type="primary", use_container_width=True):
+                    try:
+                        api.admin_update_config(key, {"value": new_val})
+                        st.session_state["admin_msg"] = f"Config '{key}' updated to {new_val}"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"{e}")
+
+
+def page_admin_patients():
+    """Patient management — search, view risk scores, reset risks."""
+    st.title("🏥 Patient Management")
+
+    if st.session_state.get("admin_msg"):
+        st.success(st.session_state.pop("admin_msg"))
+
+    # Load doctors for filters
+    try:
+        all_docs = api.admin_list_doctors()
+    except Exception:
+        all_docs = []
+    departments = sorted(set(d.get("specialization", "") for d in all_docs if d.get("specialization")))
+
+    # Filters
+    fc1, fc2, fc3, fc4 = st.columns([3, 2, 2, 1])
+    search = fc1.text_input("🔍 Search", key="admin_pat_search", placeholder="Name or phone...")
+    filter_dept = fc2.selectbox("Department", ["All"] + departments, key="admin_pat_dept")
+    if filter_dept != "All":
+        dept_docs = [d for d in all_docs if d.get("specialization") == filter_dept]
+    else:
+        dept_docs = all_docs
+    doc_names = ["All"] + [d["full_name"] for d in dept_docs]
+    filter_doc = fc3.selectbox("Doctor", doc_names, key="admin_pat_doc")
+    high_risk = fc4.checkbox("High risk", key="admin_pat_hr")
+
+    # Resolve doctor_id
+    sel_doc_id = ""
+    if filter_doc != "All":
+        match = [d for d in dept_docs if d["full_name"] == filter_doc]
+        if match:
+            sel_doc_id = str(match[0]["doctor_id"])
+
+    try:
+        patients = api.admin_list_patients(
+            search=search if search and len(search) >= 2 else "",
+            high_risk_only=high_risk,
+            specialization="" if filter_dept == "All" else filter_dept,
+            doctor_id=sel_doc_id,
+        )
+    except Exception as e:
+        st.error(f"Failed: {e}")
+        return
+
+    if not patients:
+        st.info("No patients found.")
+        return
+
+    st.caption(f"Showing {len(patients)} patients")
+
+    for p in patients:
+        pid = str(p["patient_id"])
+        try:
+            risk = float(p.get("risk_score") or 0)
+        except (ValueError, TypeError):
+            risk = 0.0
+        risk_dot = "🟢" if risk < 3 else "🟡" if risk < 7 else "🔴"
+        try:
+            total_appt = int(p.get("total_appointments") or 0)
+        except (ValueError, TypeError):
+            total_appt = 0
+        try:
+            no_shows = int(p.get("no_shows") or 0)
+        except (ValueError, TypeError):
+            no_shows = 0
+        ns_rate = f"{(no_shows / total_appt * 100):.0f}%" if total_appt > 0 else "—"
+
+        with st.container(border=True):
+            pc1, pc2, pc3 = st.columns([3, 2, 1])
+            age_str = ""
+            if p.get("date_of_birth") and p["date_of_birth"] != "None":
+                try:
+                    from datetime import date as _d
+                    dob = _d.fromisoformat(str(p["date_of_birth"])[:10])
+                    age_str = f"{(_d.today() - dob).days // 365}y"
+                except Exception:
+                    pass
+            gender_str = (p.get("gender") or "—")[:1].upper() if p.get("gender") and p["gender"] != "None" else "—"
+            pc1.markdown(
+                f"**{p.get('full_name', '—')}**  •  {age_str}/{gender_str}  "
+                f"•  📞 {p.get('phone') or '—'}  •  🩸 {p.get('blood_group') or '—'}"
+            )
+            if p.get("abha_id") and p["abha_id"] != "None":
+                pc1.caption(f"ABHA: {p['abha_id']}")
+
+            pc2.write(f"{risk_dot} Risk: **{risk:.1f}**  •  Visits: **{total_appt}**  •  No-shows: **{no_shows}** ({ns_rate})")
+
+            if risk > 0:
+                with pc3.popover("Reset Risk"):
+                    new_risk = st.number_input("New score", 0.0, 10.0, 0.0,
+                                               step=0.5, key=f"rr_{pid}")
+                    if st.button("Reset", key=f"rr_btn_{pid}", type="primary",
+                                 use_container_width=True):
+                        try:
+                            api.admin_reset_risk(pid, new_risk)
+                            st.session_state["admin_msg"] = f"Risk reset for {p['full_name']}"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"{e}")
+
+
+def page_admin_sessions():
+    """Session overview — all sessions across all doctors, with department & doctor filters."""
+    st.title("📅 Session Overview")
+
+    # Load doctors for filter dropdowns
+    try:
+        all_docs = api.admin_list_doctors()
+    except Exception:
+        all_docs = []
+
+    departments = sorted(set(d.get("specialization", "") for d in all_docs if d.get("specialization")))
+
+    # Filters row
+    fc1, fc2, fc3, fc4 = st.columns(4)
+    from datetime import date as _date_cls
+    filter_date = fc1.date_input("Date", value=_date_cls.today(), key="admin_sess_date")
+    filter_dept = fc2.selectbox("Department", ["All"] + departments, key="admin_sess_dept")
+    # Doctor dropdown — filtered by department
+    if filter_dept != "All":
+        dept_docs = [d for d in all_docs if d.get("specialization") == filter_dept]
+    else:
+        dept_docs = all_docs
+    doc_names = ["All"] + [d["full_name"] for d in dept_docs]
+    filter_doc = fc3.selectbox("Doctor", doc_names, key="admin_sess_doc")
+    filter_status = fc4.selectbox("Status", ["all", "active", "inactive", "completed", "cancelled"],
+                                   key="admin_sess_status")
+
+    # Resolve doctor_id
+    sel_doc_id = ""
+    if filter_doc != "All":
+        match = [d for d in dept_docs if d["full_name"] == filter_doc]
+        if match:
+            sel_doc_id = str(match[0]["doctor_id"])
+
+    try:
+        sessions = api.admin_list_sessions(
+            date_str=str(filter_date),
+            status="" if filter_status == "all" else filter_status,
+            specialization="" if filter_dept == "All" else filter_dept,
+            doctor_id=sel_doc_id,
+        )
+    except Exception as e:
+        st.error(f"Failed: {e}")
+        return
+
+    if not sessions:
+        st.info("No sessions found.")
+        return
+
+    st.caption(f"{len(sessions)} sessions")
+
+    # Group by department → doctor
+    by_dept = {}
+    for s in sessions:
+        dept = s.get("specialization", "Other")
+        if dept not in by_dept:
+            by_dept[dept] = {}
+        doc = s.get("doctor_name", "Unknown")
+        if doc not in by_dept[dept]:
+            by_dept[dept][doc] = []
+        by_dept[dept][doc].append(s)
+
+    for dept in sorted(by_dept.keys()):
+        st.subheader(f"🏥 {dept}")
+        for doc_name, doc_sessions in sorted(by_dept[dept].items()):
+            with st.expander(f"🩺 {doc_name} ({len(doc_sessions)} sessions)", expanded=True):
+                for s in doc_sessions:
+                    status = s.get("status", "—")
+                    si = {"active": "🟢", "inactive": "🟡", "completed": "✅", "cancelled": "❌"}.get(status, "•")
+                    start = str(s.get("start_time", ""))[:5]
+                    end = str(s.get("end_time", ""))[:5]
+                    booked = s.get("booked_count", "0")
+                    total = s.get("total_slots", "0")
+                    delay = s.get("delay_minutes", "0")
+
+                    detail = f"{booked}/{total} booked"
+                    if str(delay) != "0":
+                        detail += f"  |  ⏰ {delay}min delay"
+
+                    st.markdown(
+                        f'<div style="background:#fff;border:1px solid #d1d5db;border-radius:8px;'
+                        f'padding:10px 14px;margin-bottom:6px;color:#1e293b">'
+                        f'{si} <strong>{start} – {end}</strong>  •  {detail}'
+                        f'<span style="float:right;color:#6b7280;font-size:0.85em">{status.title()}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if s.get("notes") and s["notes"] != "None":
+                        st.caption(f"📝 {s['notes']}")
+
+
+def page_admin_audit():
+    """Audit log viewer — all system actions."""
+    st.title("📜 Audit Logs")
+
+    # Filters
+    fc1, fc2, fc3 = st.columns(3)
+    action_filter = fc1.selectbox(
+        "Action",
+        ["all", "BOOKED", "CANCELLED", "SESSION_CANCELLED", "WAITLISTED",
+         "check_in", "complete_session", "activate_session", "deactivate_session",
+         "reschedule", "escalate_priority"],
+        key="audit_action",
+    )
+    from datetime import date as _date_cls
+    from_date = fc2.date_input("From", value=_date_cls.today(), key="audit_from")
+    to_date = fc3.date_input("To", value=_date_cls.today(), key="audit_to")
+
+    try:
+        result = api.admin_get_audit(
+            action="" if action_filter == "all" else action_filter,
+            from_date=str(from_date),
+            to_date=str(to_date),
+        )
+    except Exception as e:
+        st.error(f"Failed: {e}")
+        return
+
+    logs = result.get("logs", [])
+    total = result.get("total", 0)
+
+    st.caption(f"Showing {len(logs)} of {total} log entries")
+
+    if not logs:
+        st.info("No audit entries for the selected filters.")
+        return
+
+    for log in logs:
+        action = log.get("action", "—")
+        action_icons = {
+            "BOOKED": "📅", "CANCELLED": "❌", "SESSION_CANCELLED": "🚫",
+            "WAITLISTED": "📋", "check_in": "✅", "complete_session": "✔️",
+            "activate_session": "🟢", "deactivate_session": "🔴",
+            "reschedule": "🔄", "escalate_priority": "⚡",
+        }
+        icon = action_icons.get(action, "•")
+        ts = str(log.get("created_at", ""))[:19]
+        performer = log.get("performed_by_name") or "System"
+        patient = log.get("patient_name") or "—"
+        meta = log.get("metadata") or {}
+
+        with st.container(border=True):
+            lc1, lc2 = st.columns([4, 1])
+            lc1.markdown(f"{icon} **{action.replace('_', ' ').title()}** — Patient: **{patient}**")
+            lc1.caption(f"By: {performer}  •  {ts}")
+            if meta:
+                meta_str = ", ".join(f"{k}: {v}" for k, v in meta.items() if k not in ("ip_address",))
+                if meta_str:
+                    lc1.caption(f"Details: {meta_str}")
+            lc2.caption(action)
+
+
 def page_admin_cancel():
     st.title("❌ Cancel Entire Session")
     st.error("This cancels ALL appointments. No penalties applied to patients.")
@@ -2751,7 +3344,9 @@ def page_dashboard():
         page_patient_dashboard()
     elif role == "doctor":
         page_doctor_dashboard()
-    elif role in ("nurse", "admin"):
+    elif role == "admin":
+        page_admin_dashboard()
+    elif role == "nurse":
         page_staff_session()
 
 
@@ -2765,6 +3360,13 @@ PAGE_MAP = {
     "doctor_session": page_doctor_session,
     "staff_session": page_staff_session,
     "nurse_emergency": page_nurse_emergency,
+    "admin_home": page_admin_dashboard,
+    "admin_users": page_admin_users,
+    "admin_doctors": page_admin_doctors,
+    "admin_sessions_overview": page_admin_sessions,
+    "admin_patients": page_admin_patients,
+    "admin_config": page_admin_config,
+    "admin_audit": page_admin_audit,
     "admin_cancel": page_admin_cancel,
 }
 

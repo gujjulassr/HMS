@@ -32,7 +32,7 @@ createdb -U $DB_USER $DB_NAME
 
 # Step 2: Run all 12 table migrations in order
 echo ""
-echo "→ Running migrations..."
+echo "→ Running table migrations (001-012)..."
 
 for i in $(seq -w 1 12); do
     FILE=$(ls migrations/0${i}_*.sql 2>/dev/null)
@@ -54,7 +54,34 @@ if [ $? -ne 0 ]; then
     echo "   ✓ Seed data loaded"
 fi
 
-# Step 4: Verify
+# Step 4: Run post-seed migrations (014-016)
+echo ""
+echo "→ Running post-seed migrations (014-016)..."
+
+# 014: Add inactive status to sessions + seed scheduling config
+psql -U $DB_USER -d $DB_NAME -f migrations/014_add_inactive_status_and_afternoon_session.sql -q 2>&1 | grep -i error
+if [ $? -ne 0 ]; then
+    echo "   ✓ 014_add_inactive_status_and_afternoon_session.sql"
+fi
+
+psql -U $DB_USER -d $DB_NAME -f migrations/014_seed_scheduling_config.sql -q 2>&1 | grep -i error
+if [ $? -ne 0 ]; then
+    echo "   ✓ 014_seed_scheduling_config.sql"
+fi
+
+# 015: Refresh sessions to today
+psql -U $DB_USER -d $DB_NAME -f migrations/015_refresh_sessions_to_today.sql -q 2>&1 | grep -i error
+if [ $? -ne 0 ]; then
+    echo "   ✓ 015_refresh_sessions_to_today.sql"
+fi
+
+# 016: Widen audit actions + add duration_minutes
+psql -U $DB_USER -d $DB_NAME -f migrations/016_widen_audit_actions_and_add_duration.sql -q 2>&1 | grep -i error
+if [ $? -ne 0 ]; then
+    echo "   ✓ 016_widen_audit_actions_and_add_duration.sql"
+fi
+
+# Step 5: Verify
 echo ""
 echo "→ Verifying tables..."
 echo ""
@@ -79,7 +106,7 @@ ORDER BY table_name;
 "
 
 echo ""
-echo "✅ Done! All 12 tables created and seeded."
+echo "✅ Done! All migrations applied and data seeded."
 echo ""
 echo "Test credentials:"
 echo "  Email:    ravi.kumar@gmail.com"

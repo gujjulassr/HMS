@@ -377,81 +377,141 @@ async def cancel_session_appointments(
     When a doctor can't make it or session is cancelled:
     1. Cancel all booked/checked_in appointments (no risk penalty to patients)
     2. Cancel all waitlist entries
-    3. Notify all affected patients
-    4. Mark session as cancelled
+    3. Mark session as cancelled
+    4. Best-effort: notify patients, write audit log
     """
+    from sqlalchemy import text
+
     session = await SessionModel.get_by_id(db, session_id)
     if not session:
         raise ValueError("Session not found")
-    if session.status != "active":
+    if session.status not in ("active", "inactive"):
         raise ValueError(f"Session is already {session.status}")
 
-    # Get all active appointments
-    from sqlalchemy import text
-    result = await db.execute(
-        text("""
-            SELECT * FROM appointments
-            WHERE session_id = :sid AND status IN ('booked', 'checked_in')
-        """),
+    # ── Block if any patient is currently in_progress ────────
+    in_prog = await db.execute(
+        text("SELECT COUNT(*) FROM appointments WHERE session_id = :sid AND status = 'in_progress'"),
         {"sid": session_id},
     )
-    appointments = [Appointment(**row) for row in result.mappings().all()]
+    if in_prog.scalar() > 0:
+        raise ValueError("Cannot cancel session — a patient is currently in progress. Finish them first.")
+
+    # ── Step 1a: Mark booked patients as no_show ──────────────
+    booked_result = await db.execute(
+        text("SELECT id, patient_id FROM appointments WHERE session_id = :sid AND status = 'booked'"),
+        {"sid": session_id},
+    )
+    booked_rows = booked_result.mappings().all()
+
+    no_show_count = 0
+    for row in booked_rows:
+        await db.execute(
+            text("UPDATE appointments SET status = 'no_show' WHERE id = :aid"),
+            {"aid": row["id"]},
+        )
+        # Risk penalty for no-show (+0.5)
+        try:
+            await db.execute(
+                text("UPDATE patients SET risk_score = LEAST(risk_score + 0.5, 10.0) WHERE id = :pid"),
+                {"pid": row["patient_id"]},
+            )
+        except Exception:
+            pass
+        no_show_count += 1
+
+    # ── Step 1b: Mark checked_in patients as cancelled ────────
+    checked_in_result = await db.execute(
+        text("SELECT id, patient_id FROM appointments WHERE session_id = :sid AND status = 'checked_in'"),
+        {"sid": session_id},
+    )
+    checked_in_rows = checked_in_result.mappings().all()
 
     cancelled_count = 0
-    for appt in appointments:
-        await AppointmentModel.update_status(db, appt.id, "cancelled")
-
-        # Notify patient (no risk penalty — this isn't their fault)
-        patient = await PatientModel.get_by_id(db, appt.patient_id)
-        if patient:
-            await NotificationModel.create(
-                db,
-                user_id=patient.user_id,
-                type="SESSION_CANCELLED",
-                channel="in_app",
-                content=f"Your appointment has been cancelled: {reason}. Please rebook.",
-                appointment_id=appt.id,
-            )
+    for row in checked_in_rows:
+        await db.execute(
+            text("UPDATE appointments SET status = 'cancelled' WHERE id = :aid"),
+            {"aid": row["id"]},
+        )
         cancelled_count += 1
 
-    # Cancel waitlist entries
-    waitlist_entries = await WaitlistModel.get_by_session(db, session_id)
+    patient_ids_to_notify = [(r["id"], r["patient_id"]) for r in booked_rows + checked_in_rows]
+
+    # ── Step 2: Cancel waitlist entries ───────────────────────
     waitlist_cancelled = 0
-    for entry in waitlist_entries:
-        if entry.status == "waiting":
-            await WaitlistModel.cancel(db, entry.id)
-            patient = await PatientModel.get_by_id(db, entry.patient_id)
+    try:
+        wl_result = await db.execute(
+            text("SELECT id FROM waitlist WHERE session_id = :sid AND status = 'waiting'"),
+            {"sid": session_id},
+        )
+        for wl_row in wl_result.mappings().all():
+            await db.execute(
+                text("UPDATE waitlist SET status = 'cancelled' WHERE id = :wid"),
+                {"wid": wl_row["id"]},
+            )
+            waitlist_cancelled += 1
+    except Exception:
+        pass  # waitlist table might not exist
+
+    # ── Step 3: Mark session cancelled ────────────────────────
+    await SessionModel.cancel_session(db, session_id)
+
+    # ── Step 4: Commit core changes ──────────────────────────
+    await db.commit()
+
+    # ── Step 5: Best-effort notifications & audit (post-commit) ──
+    # These run AFTER commit, so constraint violations won't rollback the cancel.
+    for appt_id, patient_id in patient_ids_to_notify:
+        try:
+            patient = await PatientModel.get_by_id(db, patient_id)
             if patient:
                 await NotificationModel.create(
                     db,
                     user_id=patient.user_id,
-                    type="SESSION_CANCELLED",
-                    channel="in_app",
-                    content=f"Session cancelled: {reason}. Your waitlist entry has been removed.",
+                    type="cancellation",
+                    channel="push",
+                    content=f"Your appointment has been cancelled: {reason}. Please rebook.",
+                    appointment_id=appt_id,
                 )
-            waitlist_cancelled += 1
+            await db.commit()
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
 
-    # Mark session cancelled
-    await SessionModel.cancel_session(db, session_id)
+    try:
+        await AuditModel.create(
+            db,
+            action="SESSION_CANCELLED",
+            performed_by_user_id=performed_by_user_id,
+            metadata={
+                "session_id": str(session_id),
+                "reason": reason,
+                "no_show_count": no_show_count,
+                "appointments_cancelled": cancelled_count,
+                "waitlist_cancelled": waitlist_cancelled,
+            },
+        )
+        await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
-    # Audit
-    await AuditModel.create(
-        db,
-        action="SESSION_CANCELLED",
-        performed_by_user_id=performed_by_user_id,
-        metadata={
-            "session_id": str(session_id),
-            "reason": reason,
-            "appointments_cancelled": cancelled_count,
-            "waitlist_cancelled": waitlist_cancelled,
-        },
-    )
-
-    await db.commit()
+    parts = []
+    if no_show_count:
+        parts.append(f"{no_show_count} no-show")
+    if cancelled_count:
+        parts.append(f"{cancelled_count} cancelled")
+    if waitlist_cancelled:
+        parts.append(f"{waitlist_cancelled} waitlist removed")
+    summary = ", ".join(parts) if parts else "no pending patients"
 
     return {
         "status": "session_cancelled",
-        "message": f"Session cancelled. {cancelled_count} appointments and {waitlist_cancelled} waitlist entries affected.",
+        "message": f"Session cancelled. {summary}.",
         "appointments_cancelled": cancelled_count,
+        "no_show_count": no_show_count,
         "waitlist_cancelled": waitlist_cancelled,
     }

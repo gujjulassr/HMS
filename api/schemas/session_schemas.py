@@ -96,4 +96,5 @@ class CancelSessionResponse(BaseModel):
     status: str
     message: str
     appointments_cancelled: int
+    no_show_count: int = 0
     waitlist_cancelled: int

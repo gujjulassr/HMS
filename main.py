@@ -14,6 +14,7 @@ from api.routes.doctor import router as doctor_router
 from api.routes.appointment import router as appointment_router
 from api.routes.session_mgmt import router as session_mgmt_router
 from api.routes.queue import router as queue_router
+from api.routes.admin import router as admin_router
 
 
 # ─── Lifespan: startup + shutdown events ─────────────────────
@@ -64,3 +65,5 @@ app.include_router(appointment_router, prefix="/api/appointments", tags=["Appoin
 app.include_router(session_mgmt_router, prefix="/api/sessions", tags=["Session Management"])
 
 app.include_router(queue_router, prefix="/api/queue", tags=["Queue"])
+
+app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])

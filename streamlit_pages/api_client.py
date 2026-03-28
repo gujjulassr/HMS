@@ -351,3 +351,144 @@ def staff_register_book(payload: dict) -> dict:
     r = httpx.post(f"{BASE_URL}/appointments/staff-register-book", json=payload, headers=_headers(), timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
+
+
+# ─── Admin ────────────────────────────────────────────────
+
+def admin_stats() -> dict:
+    """GET /admin/stats — dashboard stats."""
+    r = httpx.get(f"{BASE_URL}/admin/stats", headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_list_users(role: str = "", include_inactive: bool = False) -> list:
+    """GET /admin/users — list all users."""
+    params = {}
+    if role:
+        params["role"] = role
+    if include_inactive:
+        params["include_inactive"] = "true"
+    r = httpx.get(f"{BASE_URL}/admin/users", params=params, headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_create_user(payload: dict) -> dict:
+    """POST /admin/users — create staff user."""
+    r = httpx.post(f"{BASE_URL}/admin/users", json=payload, headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_update_user(user_id: str, payload: dict) -> dict:
+    """PUT /admin/users/{id} — update user."""
+    r = httpx.put(f"{BASE_URL}/admin/users/{user_id}", json=payload, headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_toggle_user(user_id: str) -> dict:
+    """PUT /admin/users/{id}/toggle — activate/deactivate."""
+    r = httpx.put(f"{BASE_URL}/admin/users/{user_id}/toggle", headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_list_departments() -> list:
+    """GET /admin/departments — all unique departments."""
+    r = httpx.get(f"{BASE_URL}/admin/departments", headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_list_doctors(specialization: str = "") -> list:
+    """GET /admin/doctors — all doctors with details."""
+    params = {}
+    if specialization:
+        params["specialization"] = specialization
+    r = httpx.get(f"{BASE_URL}/admin/doctors", params=params, headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_update_doctor(doctor_id: str, payload: dict) -> dict:
+    """PUT /admin/doctors/{id} — update doctor settings."""
+    r = httpx.put(f"{BASE_URL}/admin/doctors/{doctor_id}", json=payload, headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_get_config() -> list:
+    """GET /admin/config — all scheduling config."""
+    r = httpx.get(f"{BASE_URL}/admin/config", headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_update_config(key: str, payload: dict) -> dict:
+    """PUT /admin/config/{key} — update config value."""
+    r = httpx.put(f"{BASE_URL}/admin/config/{key}", json=payload, headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_get_audit(action: str = "", from_date: str = "", to_date: str = "",
+                    limit: int = 50, offset: int = 0) -> dict:
+    """GET /admin/audit — query audit logs."""
+    params = {"limit": limit, "offset": offset}
+    if action:
+        params["action"] = action
+    if from_date:
+        params["from_date"] = from_date
+    if to_date:
+        params["to_date"] = to_date
+    r = httpx.get(f"{BASE_URL}/admin/audit", params=params, headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_list_patients(search: str = "", high_risk_only: bool = False,
+                        specialization: str = "", doctor_id: str = "",
+                        limit: int = 50, offset: int = 0) -> list:
+    """GET /admin/patients — list patients."""
+    params = {"limit": limit, "offset": offset}
+    if search:
+        params["search"] = search
+    if high_risk_only:
+        params["high_risk_only"] = "true"
+    if specialization:
+        params["specialization"] = specialization
+    if doctor_id:
+        params["doctor_id"] = doctor_id
+    r = httpx.get(f"{BASE_URL}/admin/patients", params=params, headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_reset_risk(patient_id: str, new_score: float = 0.0) -> dict:
+    """PUT /admin/patients/{id}/reset-risk — reset risk score."""
+    r = httpx.put(
+        f"{BASE_URL}/admin/patients/{patient_id}/reset-risk",
+        json={"patient_id": patient_id, "new_score": new_score},
+        headers=_headers(), timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_list_sessions(date_str: str = "", status: str = "",
+                        specialization: str = "", doctor_id: str = "") -> list:
+    """GET /admin/sessions — all sessions."""
+    params = {}
+    if date_str:
+        params["date_str"] = date_str
+    if status:
+        params["status"] = status
+    if specialization:
+        params["specialization"] = specialization
+    if doctor_id:
+        params["doctor_id"] = doctor_id
+    r = httpx.get(f"{BASE_URL}/admin/sessions", params=params, headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
