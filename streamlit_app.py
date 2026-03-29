@@ -1226,7 +1226,11 @@ def page_patient_profile():
             fam_name = st.text_input("Full Name *", placeholder="e.g. Sunita Kumar")
             fam_phone = st.text_input("Phone Number", placeholder="e.g. 9876543210")
             fam_relationship = st.selectbox("Relationship *",
-                                             ["spouse", "parent", "child", "sibling", "guardian", "other"])
+                                             ["spouse", "parent", "child", "sibling", "guardian", "cousin","other"])
+
+
+            if fam_relationship == "other":
+                fam_relationship = st.text_input("Please specify relationship", placeholder="e.g. aunt, uncle, friend")
         with fc2:
             from datetime import date as _fam_d
             fam_dob = st.date_input("Date of Birth", value=_fam_d(1990, 1, 1),
@@ -1242,6 +1246,8 @@ def page_patient_profile():
     if fam_submitted:
         if not fam_name or len(fam_name.strip()) < 2:
             st.error("Please enter the family member's full name.")
+        elif fam_relationship =='other' and not fam_relationship.strip():
+            st.error("Please specify the relationship.")
         else:
             try:
                 payload = {
