@@ -13,7 +13,8 @@ Fails silently (logs errors) so email issues never block core functionality.
 import logging
 from typing import Optional
 
-from go.adapters.email_adapter import EmailPayload, get_email_adapter
+from go.adapters.email_adapter import EmailPayload, EmailAttachment, get_email_adapter
+from go.services.calendar_service import build_booking_event, build_cancellation_event
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ async def send_email(
     subject: str,
     html_body: str,
     plain_body: Optional[str] = None,
+    attachments: Optional[list[EmailAttachment]] = None,
 ) -> bool:
     """
     Send an email via the configured adapter.
@@ -36,6 +38,7 @@ async def send_email(
         subject=subject,
         html_body=html_body,
         plain_body=plain_body,
+        attachments=attachments or [],
     )
     return await adapter.send(payload)
 
@@ -100,8 +103,10 @@ async def send_booking_confirmation(
     session_date: str,
     slot_time: str,
     slot_number: int,
+    appointment_id: str = "",
+    duration_minutes: int = 15,
 ) -> bool:
-    """Send booking confirmation email."""
+    """Send booking confirmation email with calendar event attached."""
     content = f"""
     <h2 style="color: #059669; margin-top: 0;">✅ Appointment Confirmed</h2>
     <p>Dear <strong>{patient_name}</strong>,</p>
@@ -134,14 +139,41 @@ async def send_booking_confirmation(
             💡 <strong>Reminder:</strong> Please arrive 15 minutes before your scheduled time.
             Bring your ID and any previous medical records.
         </p>
+        <p style="margin: 8px 0 0 0; font-size: 14px; color: #1e40af;">
+            📅 A calendar event is attached — open it to add this appointment to your calendar.
+        </p>
     </div>
     """
+
+    # Build calendar event attachment
+    attachments = []
+    if appointment_id:
+        ics_bytes = build_booking_event(
+            appointment_id=appointment_id,
+            patient_name=patient_name,
+            patient_email=to_email,
+            doctor_name=doctor_name,
+            specialization=specialization,
+            session_date=session_date,
+            slot_time=slot_time,
+            slot_number=slot_number,
+            duration_minutes=duration_minutes,
+        )
+        if ics_bytes:
+            attachments.append(EmailAttachment(
+                filename="appointment.ics",
+                content=ics_bytes,
+                mime_type="text/calendar",
+                mime_subtype="calendar",
+            ))
+
     return await send_email(
         to_email,
         f"Appointment Confirmed — {doctor_name} on {session_date}",
         _base_template("Booking Confirmation", content),
         plain_body=f"Hi {patient_name}, your appointment with {doctor_name} ({specialization}) "
                    f"is confirmed for {session_date} at {slot_time}, slot #{slot_number}.",
+        attachments=attachments,
     )
 
 
@@ -152,8 +184,9 @@ async def send_cancellation_email(
     session_date: str,
     slot_time: str,
     reason: str = "",
+    appointment_id: str = "",
 ) -> bool:
-    """Send appointment cancellation email."""
+    """Send appointment cancellation email with calendar cancellation event attached."""
     reason_html = f'<p style="color: #6b7280;">Reason: <em>{reason}</em></p>' if reason else ""
     content = f"""
     <h2 style="color: #dc2626; margin-top: 0;">❌ Appointment Cancelled</h2>
@@ -174,14 +207,42 @@ async def send_cancellation_email(
         </tr>
     </table>
     {reason_html}
+    <div style="background: #fef2f2; border-left: 4px solid #ef4444; padding: 12px 16px;
+                border-radius: 4px; margin: 16px 0;">
+        <p style="margin: 0; font-size: 14px; color: #991b1b;">
+            📅 A calendar update is attached — open it to remove this appointment from your calendar.
+        </p>
+    </div>
     <p>You can book a new appointment anytime through the patient portal.</p>
     """
+
+    # Build calendar cancellation event
+    attachments = []
+    if appointment_id:
+        ics_bytes = build_cancellation_event(
+            appointment_id=appointment_id,
+            patient_name=patient_name,
+            patient_email=to_email,
+            doctor_name=doctor_name,
+            session_date=session_date,
+            slot_time=slot_time,
+            reason=reason,
+        )
+        if ics_bytes:
+            attachments.append(EmailAttachment(
+                filename="cancellation.ics",
+                content=ics_bytes,
+                mime_type="text/calendar",
+                mime_subtype="calendar",
+            ))
+
     return await send_email(
         to_email,
         f"Appointment Cancelled — {doctor_name} on {session_date}",
         _base_template("Cancellation Notice", content),
         plain_body=f"Hi {patient_name}, your appointment with {doctor_name} on {session_date} "
                    f"at {slot_time} has been cancelled. {reason}",
+        attachments=attachments,
     )
 
 

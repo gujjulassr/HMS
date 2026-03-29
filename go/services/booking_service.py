@@ -326,36 +326,53 @@ async def cancel_appointment(
                 )
                 await WaitlistModel.promote(db, next_waiting.id)
                 await SessionModel.update_booked_count(db, session.id, delta=1)
-
-                # Notify the promoted patient
-                beneficiary_user = await PatientModel.get_by_id(db, next_waiting.patient_id)
-                if beneficiary_user:
-                    await NotificationModel.create(
-                        db,
-                        user_id=beneficiary_user.user_id,
-                        type="WAITLIST_PROMOTED",
-                        channel="in_app",
-                        content=f"You've been promoted from the waitlist! Appointment in slot {appointment.slot_number}.",
-                        appointment_id=promoted_appt.id,
-                    )
                 promoted_msg = " A waitlist patient was auto-promoted to your slot."
 
-    # ── Step 9: Audit ──
-    await AuditModel.create(
-        db,
-        action="CANCELLED",
-        performed_by_user_id=cancelled_by_user_id,
-        appointment_id=appointment_id,
-        patient_id=appointment.patient_id,
-        metadata={
-            "reason": reason,
-            "hours_before": round(hours_before, 2),
-            "risk_delta": float(risk_delta),
-            "new_risk_score": new_risk_score,
-        },
-    )
-
+    # ── COMMIT critical work first ──
     await db.commit()
+
+    # ── Step 9: Audit (non-critical, after commit) ──
+    try:
+        await AuditModel.create(
+            db,
+            action="CANCELLED",
+            performed_by_user_id=cancelled_by_user_id,
+            appointment_id=appointment_id,
+            patient_id=appointment.patient_id,
+            metadata={
+                "reason": reason,
+                "hours_before": round(hours_before, 2),
+                "risk_delta": float(risk_delta),
+                "new_risk_score": new_risk_score,
+            },
+        )
+        await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # Notification for waitlist promotion (non-critical, after commit)
+    if promoted_msg and session:
+        try:
+            next_waiting_check = await WaitlistModel.get_next_waiting(db, session.id)
+            # Use the promoted appointment info we already have
+            beneficiary_user = await PatientModel.get_by_id(db, appointment.patient_id)
+            if beneficiary_user:
+                await NotificationModel.create(
+                    db,
+                    user_id=beneficiary_user.user_id,
+                    type="waitlist_promotion",
+                    channel="push",
+                    content=f"Waitlist promotion: appointment in slot {appointment.slot_number}.",
+                )
+                await db.commit()
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
 
     return {
         "status": "cancelled",

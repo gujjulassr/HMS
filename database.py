@@ -72,6 +72,50 @@ async def init_db():
             EXCEPTION WHEN duplicate_column THEN NULL;
             END $$
         """))
+
+        # Fix notification_log CHECK constraints — allow all types and channels we use
+        await conn.execute(text("""
+            DO $$ BEGIN
+                ALTER TABLE notification_log DROP CONSTRAINT IF EXISTS notification_log_type_check;
+                ALTER TABLE notification_log DROP CONSTRAINT IF EXISTS notification_log_channel_check;
+            EXCEPTION WHEN undefined_object THEN NULL;
+            END $$
+        """))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                ALTER TABLE notification_log ADD CONSTRAINT notification_log_type_check CHECK (
+                    type IN (
+                        'booking_confirmation', 'cancellation', 'reminder',
+                        'waitlist_promotion', 'queue_update', 'relationship_request',
+                        'BOOKED_BY_STAFF', 'EMERGENCY_BOOKED', 'DELAY_UPDATE',
+                        'CANNOT_BE_SEEN', 'YOUR_TURN', 'SESSION_CANCELLED'
+                    )
+                );
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$
+        """))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                ALTER TABLE notification_log ADD CONSTRAINT notification_log_channel_check CHECK (
+                    channel IN ('email', 'sms', 'push', 'in_app')
+                );
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$
+        """))
+        # Replace absolute unique constraint on appointment slots with a partial
+        # one that ignores cancelled rows — so a cancelled slot can be re-booked.
+        await conn.execute(text(
+            "ALTER TABLE appointments DROP CONSTRAINT IF EXISTS appointments_session_id_slot_number_slot_position_key"
+        ))
+        await conn.execute(text(
+            "DROP INDEX IF EXISTS uq_appointment_slot_active"
+        ))
+        await conn.execute(text("""
+            CREATE UNIQUE INDEX uq_appointment_slot_active
+            ON appointments (session_id, slot_number, slot_position)
+            WHERE status != 'cancelled'
+        """))
+
         print("[DB] Auto-migrations applied")
 
 

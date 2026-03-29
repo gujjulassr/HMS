@@ -11,6 +11,15 @@ BASE_URL = "http://localhost:8000/api"
 TIMEOUT = 10.0
 
 
+def _raise_api_error(r: httpx.Response):
+    """Extract the API error detail and raise a clean exception."""
+    try:
+        detail = r.json().get("detail", r.text)
+    except Exception:
+        detail = r.text
+    raise Exception(f"{r.status_code}: {detail}")
+
+
 def _headers() -> dict:
     """Attach JWT access token if logged in."""
     token = st.session_state.get("access_token")
@@ -85,34 +94,23 @@ def login(email: str, password: str) -> dict:
 
 
     if r.status_code >= 400:
-        try:
-            detail = r.json().get("detail", r.text)
-        except Exception:
-            detail = r.text
-        raise Exception(f"{r.status_code}: {detail}")
-
-    # r.raise_for_status()
+        _raise_api_error(r)
     return r.json()
 
 
 def register(payload: dict) -> dict:
     """POST /auth/register — JSON body."""
     r = httpx.post(f"{BASE_URL}/auth/register", json=payload, timeout=TIMEOUT)
-
     if r.status_code >= 400:
-        try:
-            detail = r.json().get("detail", r.text)
-        except Exception:
-            detail = r.text
-        raise Exception(f"{r.status_code}: {detail}")
-    # r.raise_for_status()
+        _raise_api_error(r)
     return r.json()
 
 
 def get_me() -> dict:
     """GET /auth/me — current user profile."""
     r = _request("GET", f"{BASE_URL}/auth/me")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -123,7 +121,8 @@ def refresh_token(refresh_tok: str) -> dict:
         json={"refresh_token": refresh_tok},
         timeout=TIMEOUT,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -132,49 +131,44 @@ def refresh_token(refresh_tok: str) -> dict:
 def get_my_profile() -> dict:
     r = _request("GET", f"{BASE_URL}/patients/me")
     if r.status_code >= 400:
-        try:
-            detail = r.json().get("detail", r.text)
-        except Exception:
-            detail = r.text
-        raise Exception(f"{r.status_code}: {detail}")
+        _raise_api_error(r)
     return r.json()
 
 
 def update_my_profile(payload: dict) -> dict:
     r = _request("PUT", f"{BASE_URL}/patients/me", json=payload)
     if r.status_code >= 400:
-        # Show the actual API error detail instead of generic httpx message
-        try:
-            detail = r.json().get("detail", r.text)
-        except Exception:
-            detail = r.text
-        raise Exception(f"{r.status_code}: {detail}")
+        _raise_api_error(r)
     return r.json()
 
 
 def get_my_relationships() -> list:
     r = _request("GET", f"{BASE_URL}/patients/me/relationships")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def add_relationship(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/patients/me/relationships", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def find_beneficiary(abha_id: str) -> list:
     """GET /patients/me/find-beneficiary?abha_id=... — patient searches by ABHA/UHID."""
     r = _request("GET", f"{BASE_URL}/patients/me/find-beneficiary", params={"abha_id": abha_id})
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def add_family_member(payload: dict) -> dict:
     """POST /patients/me/add-family — register new family member + auto-link."""
     r = _request("POST", f"{BASE_URL}/patients/me/add-family", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -182,18 +176,15 @@ def update_family_member(relationship_id: str, payload: dict) -> dict:
     """PUT /patients/me/relationships/{id}/beneficiary — edit family member details."""
     r = _request("PUT", f"{BASE_URL}/patients/me/relationships/{relationship_id}/beneficiary", json=payload)
     if r.status_code >= 400:
-        try:
-            detail = r.json().get("detail", r.text)
-        except Exception:
-            detail = r.text
-        raise Exception(f"{r.status_code}: {detail}")
+        _raise_api_error(r)
     return r.json()
 
 
 def search_patients(query: str) -> list:
     """GET /patients/search?q=... — staff search patients by name/phone."""
     r = _request("GET", f"{BASE_URL}/patients/search", params={"q": query})
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -204,13 +195,15 @@ def list_doctors(specialization: str = "") -> list:
     if specialization:
         params["specialization"] = specialization
     r = _request("GET", f"{BASE_URL}/doctors/", params=params)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def get_doctor(doctor_id: str) -> dict:
     r = _request("GET", f"{BASE_URL}/doctors/{doctor_id}")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -223,7 +216,8 @@ def get_doctor_sessions(doctor_id: str, from_date: str = "", to_date: str = "", 
     if include_all:
         params["include_all"] = "true"
     r = _request("GET", f"{BASE_URL}/doctors/{doctor_id}/sessions", params=params)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -235,7 +229,8 @@ def get_all_doctor_sessions(doctor_id: str, from_date: str = "", to_date: str = 
     if to_date:
         params["date_to"] = to_date
     r = _request("GET", f"{BASE_URL}/doctors/{doctor_id}/all-sessions", params=params)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -243,13 +238,23 @@ def get_all_doctor_sessions(doctor_id: str, from_date: str = "", to_date: str = 
 
 def book_appointment(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/appointments/book", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def cancel_appointment(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/appointments/cancel", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
+    return r.json()
+
+
+def staff_cancel_appointment(payload: dict) -> dict:
+    """Cancel appointment as nurse/admin/doctor (no patient role needed)."""
+    r = _request("POST", f"{BASE_URL}/appointments/staff-cancel", json=payload)
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -266,13 +271,15 @@ def get_my_appointments() -> dict:
 
 def get_appointment(appointment_id: str) -> dict:
     r = _request("GET", f"{BASE_URL}/appointments/{appointment_id}")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def emergency_book(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/appointments/emergency", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -280,51 +287,59 @@ def emergency_book(payload: dict) -> dict:
 
 def doctor_checkin(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/sessions/checkin", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def update_delay(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/sessions/update-delay", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def overtime_window(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/sessions/overtime-window", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def extend_session(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/sessions/extend", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def complete_session(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/sessions/complete-session", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def activate_session(payload: dict) -> dict:
     """POST /sessions/activate — set inactive → active."""
     r = _request("POST", f"{BASE_URL}/sessions/activate", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def deactivate_session(payload: dict) -> dict:
     """POST /sessions/deactivate — set active → inactive (blocks if patient in progress)."""
     r = _request("POST", f"{BASE_URL}/sessions/deactivate", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def cancel_session(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/sessions/cancel-session", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -332,98 +347,113 @@ def cancel_session(payload: dict) -> dict:
 
 def get_queue(session_id: str) -> dict:
     r = _request("GET", f"{BASE_URL}/queue/{session_id}")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def checkin_patient(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/queue/checkin", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def call_patient(payload: dict) -> dict:
     """POST /queue/call-patient — call a specific checked-in patient to the doctor."""
     r = _request("POST", f"{BASE_URL}/queue/call-patient", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def call_next(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/queue/next", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def escalate_priority(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/queue/escalate", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def complete_appointment(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/queue/complete", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def undo_checkin(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/queue/undo-checkin", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def set_duration(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/queue/set-duration", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def mark_no_shows(payload: dict) -> dict:
     r = _request("POST", f"{BASE_URL}/queue/no-shows", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def mark_single_noshow(payload: dict) -> dict:
     """POST /queue/no-show-single — mark one patient as no-show."""
     r = _request("POST", f"{BASE_URL}/queue/no-show-single", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def undo_send(payload: dict) -> dict:
     """POST /queue/undo-send — reverse send-to-doctor (in_progress → checked_in)."""
     r = _request("POST", f"{BASE_URL}/queue/undo-send", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def undo_complete(payload: dict) -> dict:
     """POST /queue/undo-complete — reverse completion (completed → in_progress)."""
     r = _request("POST", f"{BASE_URL}/queue/undo-complete", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def undo_noshow(payload: dict) -> dict:
     """POST /queue/undo-noshow — reverse no-show mark (no_show → booked)."""
     r = _request("POST", f"{BASE_URL}/queue/undo-noshow", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def undo_cancel(payload: dict) -> dict:
     """POST /appointments/undo-cancel — reverse patient cancellation (cancelled → booked)."""
     r = _request("POST", f"{BASE_URL}/appointments/undo-cancel", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def list_departments() -> list:
     """GET /appointments/departments — unique specialization list for dropdowns."""
     r = _request("GET", f"{BASE_URL}/appointments/departments")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -435,28 +465,32 @@ def get_operations_board(date_str: str = "", department: str = "") -> dict:
     if department:
         params["department"] = department
     r = _request("GET", f"{BASE_URL}/appointments/board", params=params)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def reassign_appointment(payload: dict) -> dict:
     """POST /appointments/reassign — move appointment to another doctor's session."""
     r = _request("POST", f"{BASE_URL}/appointments/reassign", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def staff_book(payload: dict) -> dict:
     """POST /appointments/staff-book — nurse books on behalf of a patient."""
     r = _request("POST", f"{BASE_URL}/appointments/staff-book", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def staff_register_book(payload: dict) -> dict:
     """POST /appointments/staff-register-book — nurse registers new patient and books."""
     r = _request("POST", f"{BASE_URL}/appointments/staff-register-book", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -465,7 +499,8 @@ def staff_register_book(payload: dict) -> dict:
 def admin_stats() -> dict:
     """GET /admin/stats — dashboard stats."""
     r = _request("GET", f"{BASE_URL}/admin/stats")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -477,35 +512,40 @@ def admin_list_users(role: str = "", include_inactive: bool = False) -> list:
     if include_inactive:
         params["include_inactive"] = "true"
     r = _request("GET", f"{BASE_URL}/admin/users", params=params)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def admin_create_user(payload: dict) -> dict:
     """POST /admin/users — create staff user."""
     r = _request("POST", f"{BASE_URL}/admin/users", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def admin_update_user(user_id: str, payload: dict) -> dict:
     """PUT /admin/users/{id} — update user."""
     r = _request("PUT", f"{BASE_URL}/admin/users/{user_id}", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def admin_toggle_user(user_id: str) -> dict:
     """PUT /admin/users/{id}/toggle — activate/deactivate."""
     r = _request("PUT", f"{BASE_URL}/admin/users/{user_id}/toggle")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def admin_list_departments() -> list:
     """GET /admin/departments — all unique departments."""
     r = _request("GET", f"{BASE_URL}/admin/departments")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -515,28 +555,32 @@ def admin_list_doctors(specialization: str = "") -> list:
     if specialization:
         params["specialization"] = specialization
     r = _request("GET", f"{BASE_URL}/admin/doctors", params=params)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def admin_update_doctor(doctor_id: str, payload: dict) -> dict:
     """PUT /admin/doctors/{id} — update doctor settings."""
     r = _request("PUT", f"{BASE_URL}/admin/doctors/{doctor_id}", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def admin_get_config() -> list:
     """GET /admin/config — all scheduling config."""
     r = _request("GET", f"{BASE_URL}/admin/config")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def admin_update_config(key: str, payload: dict) -> dict:
     """PUT /admin/config/{key} — update config value."""
     r = _request("PUT", f"{BASE_URL}/admin/config/{key}", json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -551,7 +595,8 @@ def admin_get_audit(action: str = "", from_date: str = "", to_date: str = "",
     if to_date:
         params["to_date"] = to_date
     r = _request("GET", f"{BASE_URL}/admin/audit", params=params)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -572,7 +617,8 @@ def admin_list_patients(search: str = "", high_risk_only: bool = False,
     if doctor_id:
         params["doctor_id"] = doctor_id
     r = _request("GET", f"{BASE_URL}/admin/patients", params=params)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -583,14 +629,16 @@ def admin_reset_risk(patient_id: str, new_score: float = 0.0) -> dict:
         f"{BASE_URL}/admin/patients/{patient_id}/reset-risk",
         json={"patient_id": patient_id, "new_score": new_score},
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def admin_get_patient(patient_id: str) -> dict:
     """GET /admin/patients/{id} — full patient detail with appointments and relationships."""
     r = _request("GET", f"{BASE_URL}/admin/patients/{patient_id}")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -601,7 +649,8 @@ def admin_update_patient(patient_id: str, payload: dict) -> dict:
         f"{BASE_URL}/admin/patients/{patient_id}/update",
         json=payload,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -618,7 +667,8 @@ def admin_list_sessions(date_str: str = "", status: str = "",
     if doctor_id:
         params["doctor_id"] = doctor_id
     r = _request("GET", f"{BASE_URL}/admin/sessions", params=params)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -627,7 +677,8 @@ def admin_list_sessions(date_str: str = "", status: str = "",
 def chat_health() -> dict:
     """GET /chat/health — Check if chatbot is configured."""
     r = _request("GET", f"{BASE_URL}/chat/health")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -642,14 +693,16 @@ def chat_send_message(message: str, patient_context: str = "") -> dict:
         json=payload,
         timeout=60.0,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
 def chat_clear() -> dict:
     """POST /chat/clear — Clear conversation thread on server."""
     r = _request("POST", f"{BASE_URL}/chat/clear")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 
@@ -661,7 +714,8 @@ def chat_transcribe(audio_bytes: bytes, filename: str = "audio.wav") -> dict:
         files={"audio": (filename, audio_bytes)},
         timeout=30.0,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_api_error(r)
     return r.json()
 
 

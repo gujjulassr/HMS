@@ -119,7 +119,7 @@ async def book_route(
         if result["appointment"]:
             appt_response = await _enrich_appointment(db, result["appointment"])
             # Send booking confirmation email (fire-and-forget)
-            notify_booking(db, result["appointment"].id)
+            await notify_booking(db, result["appointment"].id)
 
         return BookingResultResponse(
             status=result["status"],
@@ -156,22 +156,89 @@ async def cancel_route(
             cancelled_by_user_id=user.id,
             reason=body.reason,
         )
-
-        # Send cancellation email (fire-and-forget)
-        notify_cancellation(db, UUID(body.appointment_id), reason=body.reason or "")
-
-        return CancelResultResponse(
-            status=result["status"],
-            message=result["message"],
-            risk_delta=result["risk_delta"],
-            new_risk_score=result["new_risk_score"],
-        )
-
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         )
+    except Exception as e:
+        logger.error("cancel_route failed: %s", e, exc_info=True)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Cancel failed: {type(e).__name__}: {e}")
+
+    # Send cancellation email (fire-and-forget)
+    try:
+        await notify_cancellation(db, UUID(body.appointment_id), reason=body.reason or "")
+    except Exception:
+        pass
+
+    return CancelResultResponse(
+        status=result["status"],
+        message=result["message"],
+        risk_delta=result["risk_delta"],
+        new_risk_score=result["new_risk_score"],
+    )
+
+
+# ─── POST /staff-cancel — nurse/admin/doctor cancels an appointment ──
+
+@router.post("/staff-cancel")
+async def staff_cancel_route(
+    body: CancelAppointmentRequest,
+    user: User = Depends(require_role("nurse", "admin", "doctor")),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Staff cancels an appointment on behalf of a patient.
+    Skips ownership check. Risk penalty still applied to the patient.
+    """
+    appointment_id = UUID(body.appointment_id)
+
+    # Look up the appointment to find the patient
+    appointment = await AppointmentModel.get_by_id(db, appointment_id)
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    if appointment.status not in ("booked", "checked_in"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel appointment with status '{appointment.status}'",
+        )
+
+    # Get the patient who booked (needed for risk penalty + cancellation log)
+    patient = await PatientModel.get_by_id(db, appointment.booked_by_patient_id)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient record not found")
+
+    try:
+        result = await cancel_appointment(
+            db=db,
+            appointment_id=appointment_id,
+            cancelled_by_patient=patient,
+            cancelled_by_user_id=user.id,
+            reason=body.reason or "Cancelled by staff",
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except Exception as e:
+        logger.error("staff_cancel failed: %s", e, exc_info=True)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Cancel failed: {type(e).__name__}: {e}")
+
+    # Send cancellation email (fire-and-forget)
+    try:
+        await notify_cancellation(db, appointment_id, reason=body.reason or "Cancelled by staff")
+    except Exception:
+        pass
+
+    return CancelResultResponse(
+        status=result["status"],
+        message=result["message"],
+        risk_delta=result["risk_delta"],
+        new_risk_score=result["new_risk_score"],
+    )
 
 
 # ─── GET /my — list my appointments ──────────────────────────
@@ -452,17 +519,6 @@ async def emergency_book_route(
 
     # Update session booked count
     await SessionModel.update_booked_count(db, session_id, delta=1)
-
-    # Notify the patient
-    await NotificationModel.create(
-        db,
-        user_id=patient.user_id,
-        type="EMERGENCY_BOOKED",
-        channel="in_app",
-        content=f"Emergency appointment booked for you in slot {body.slot_number}. Reason: {body.reason}",
-        appointment_id=appointment.id,
-    )
-
     await db.commit()
 
     # Audit in separate transaction — failure won't undo the booking
@@ -680,20 +736,24 @@ async def staff_book(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Nurse books an appointment for a patient.
+    Nurse/Admin/Doctor books an appointment for a patient.
     Bypasses rate limiting but NOT slot capacity.
     Patient must already exist in the system.
     """
-    session_id = UUID(body["session_id"])
-    patient_id = UUID(body["patient_id"])
-    slot_number = body["slot_number"]
+    logger = logging.getLogger(__name__)
+    try:
+        session_id = UUID(body["session_id"])
+        patient_id = UUID(body["patient_id"])
+        slot_number = int(body["slot_number"])
+    except (KeyError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid input: {e}")
 
     # Validate session
     session = await SessionModel.get_by_id_for_update(db, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     if session.status != "active":
-        raise HTTPException(status_code=400, detail=f"Session is {session.status}")
+        raise HTTPException(status_code=400, detail=f"Session is '{session.status}'. Please activate it before booking.")
     if slot_number < 1 or slot_number > session.total_slots:
         raise HTTPException(status_code=400, detail=f"Invalid slot. Must be 1-{session.total_slots}")
 
@@ -711,32 +771,47 @@ async def staff_book(
     from go.services.booking_service import calculate_priority_tier
     priority_tier = calculate_priority_tier(patient.date_of_birth)
 
-    # Create appointment
-    appointment = await AppointmentModel.create(
-        db,
-        session_id=session_id,
-        patient_id=patient_id,
-        booked_by_patient_id=patient_id,
-        slot_number=slot_number,
-        slot_position=slot_pos,
-        priority_tier=priority_tier,
-    )
-
-    await SessionModel.update_booked_count(db, session_id, delta=1)
-
-    # Notify
     try:
-        await NotificationModel.create(
-            db, user_id=patient.user_id, type="BOOKED_BY_STAFF", channel="in_app",
-            content=f"An appointment has been booked for you in slot {slot_number} by staff.",
-            appointment_id=appointment.id,
+        # Create appointment
+        appointment = await AppointmentModel.create(
+            db,
+            session_id=session_id,
+            patient_id=patient_id,
+            booked_by_patient_id=patient_id,
+            slot_number=slot_number,
+            slot_position=slot_pos,
+            priority_tier=priority_tier,
         )
+
+        await SessionModel.update_booked_count(db, session_id, delta=1)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.error("staff_book create failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Booking failed: {type(e).__name__}: {e}")
+
+    # Send booking confirmation email (fire-and-forget)
+    try:
+        await notify_booking(db, appointment.id)
     except Exception:
         pass
 
-    await db.commit()
+    # Build response — all in try/except so booking is never lost
+    doc_name = "Doctor"
+    pat_name = "Patient"
+    try:
+        doctor = await DoctorModel.get_by_id(db, session.doctor_id)
+        if doctor:
+            doc_user = await UserModel.get_by_id(db, doctor.user_id)
+            if doc_user:
+                doc_name = doc_user.full_name
+        pat_user = await UserModel.get_by_id(db, patient.user_id)
+        if pat_user:
+            pat_name = pat_user.full_name
+    except Exception:
+        pass
 
-    # Audit
+    # Audit (non-critical)
     try:
         await AuditModel.create(
             db, action="book", performed_by_user_id=user.id,
@@ -748,20 +823,6 @@ async def staff_book(
     except Exception:
         try: await db.rollback()
         except Exception: pass
-
-    # Get doctor name
-    doctor = await DoctorModel.get_by_id(db, session.doctor_id)
-    doc_name = "Doctor"
-    if doctor:
-        doc_user = await UserModel.get_by_id(db, doctor.user_id)
-        if doc_user:
-            doc_name = doc_user.full_name
-
-    pat_user = await UserModel.get_by_id(db, patient.user_id)
-    pat_name = pat_user.full_name if pat_user else "Patient"
-
-    # Send booking confirmation email (fire-and-forget)
-    notify_booking(db, appointment.id)
 
     return {
         "status": "booked",

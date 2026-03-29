@@ -17,8 +17,8 @@ class Settings(BaseSettings):
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # ─── Google OAuth ─────────────────────────────────────
-    GOOGLE_CLIENT_ID: str = "YOUR_GOOGLE_CLIENT_ID"
-    GOOGLE_CLIENT_SECRET: str = "YOUR_GOOGLE_CLIENT_SECRET"
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
     GOOGLE_REDIRECT_URI: str = "http://127.0.0.1:8000/api/auth/google/callback"
 
     # ─── Email Adapter (Gmail SMTP) ────────────────────────

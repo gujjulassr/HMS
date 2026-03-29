@@ -508,18 +508,6 @@ async def call_next_patient(
     await AppointmentModel.update_status(db, next_appt.id, "in_progress")
     next_entry = await _build_queue_entry(db, next_appt, position=1)
 
-    # Notify
-    try:
-        patient = await PatientModel.get_by_id(db, next_appt.patient_id)
-        if patient:
-            await NotificationModel.create(
-                db, user_id=patient.user_id, type="YOUR_TURN", channel="in_app",
-                content="It's your turn! Please proceed to the doctor's room.",
-                appointment_id=next_appt.id,
-            )
-    except Exception as e:
-        logger.warning(f"Notification failed: {e}")
-
     # COMMIT main work first
     await db.commit()
 

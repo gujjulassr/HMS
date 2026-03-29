@@ -557,6 +557,8 @@ async def staff_register_and_book(
         payload["gender"] = gender
     if date_of_birth:
         payload["date_of_birth"] = date_of_birth
+    if symptoms:
+        payload["symptoms"] = symptoms
     return _j(await _api("POST", "/appointments/staff-register-book", ctx.context["token"], payload=payload))
 
 
@@ -889,28 +891,49 @@ def _build_agent(role: str) -> Agent:
 
 _SESSION_DB_PATH = str(pathlib.Path(__file__).resolve().parent.parent.parent / "chat_sessions.db")
 
-# Track active sessions per user: user_id -> compaction session
-_active_sessions: dict[str, OpenAIResponsesCompactionSession] = {}
+# Track active sessions per user: user_id -> (compaction session, last_access_time)
+_active_sessions: dict[str, tuple[OpenAIResponsesCompactionSession, float]] = {}
+_MAX_CACHED_SESSIONS = 200  # evict oldest when we exceed this
+
+
+def _evict_old_sessions():
+    """Remove least-recently-used sessions when cache is too large."""
+    import time
+    if len(_active_sessions) <= _MAX_CACHED_SESSIONS:
+        return
+    # Sort by last access time, remove oldest half
+    sorted_keys = sorted(_active_sessions, key=lambda k: _active_sessions[k][1])
+    to_remove = sorted_keys[:len(sorted_keys) // 2]
+    for k in to_remove:
+        del _active_sessions[k]
+    logger.info(f"Evicted {len(to_remove)} idle chat sessions (had {len(sorted_keys)})")
 
 
 def _get_session(user_id: str) -> OpenAIResponsesCompactionSession:
     """Get or create a compacted session for a user."""
-    if user_id not in _active_sessions:
-        underlying = SQLiteSession(
-            session_id=user_id,
-            db_path=_SESSION_DB_PATH,
-        )
-        _active_sessions[user_id] = OpenAIResponsesCompactionSession(
-            session_id=user_id,
-            underlying_session=underlying,
-        )
-    return _active_sessions[user_id]
+    import time
+    if user_id in _active_sessions:
+        session, _ = _active_sessions[user_id]
+        _active_sessions[user_id] = (session, time.time())
+        return session
+
+    _evict_old_sessions()
+
+    underlying = SQLiteSession(
+        session_id=user_id,
+        db_path=_SESSION_DB_PATH,
+    )
+    session = OpenAIResponsesCompactionSession(
+        session_id=user_id,
+        underlying_session=underlying,
+    )
+    _active_sessions[user_id] = (session, time.time())
+    return session
 
 
 async def clear_conversation(user_id: str) -> None:
     """Clear a user's conversation (called on 'New Chat')."""
-    if user_id in _active_sessions:
-        del _active_sessions[user_id]
+    _active_sessions.pop(user_id, None)
     # Also clear from SQLite so old history doesn't leak into new chat
     try:
         underlying = SQLiteSession(session_id=user_id, db_path=_SESSION_DB_PATH)

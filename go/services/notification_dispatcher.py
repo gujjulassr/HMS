@@ -68,6 +68,7 @@ async def _get_appointment_email_context(db: AsyncSession, appointment_id: UUID)
         slot_time = "—"
 
     return {
+        "appointment_id": str(appointment_id),
         "patient_name": row["patient_name"],
         "patient_email": row["patient_email"],
         "doctor_name": row["doctor_name"],
@@ -75,22 +76,26 @@ async def _get_appointment_email_context(db: AsyncSession, appointment_id: UUID)
         "session_date": str(row["session_date"]),
         "slot_time": slot_time,
         "slot_number": row["slot_number"],
+        "duration_minutes": row["slot_duration_minutes"],
     }
 
 
-def notify_booking(db: AsyncSession, appointment_id):
+async def notify_booking(db: AsyncSession, appointment_id):
     """
-    Fire-and-forget: send booking confirmation email.
-    Call this after a successful booking in any route.
+    Fetch email context now (while db session is alive), then fire-and-forget the send.
     """
-    async def _do():
+    try:
+        ctx = await _get_appointment_email_context(db, UUID(str(appointment_id)))
+        if not ctx or not ctx.get("patient_email"):
+            return
+        if "@dpms.local" in ctx["patient_email"]:
+            return
+    except Exception as e:
+        logger.error("notify_booking context error: %s", e)
+        return
+
+    async def _send():
         try:
-            ctx = await _get_appointment_email_context(db, UUID(str(appointment_id)))
-            if not ctx or not ctx["patient_email"]:
-                return
-            # Skip placeholder emails (family members, walk-ins)
-            if "@dpms.local" in ctx["patient_email"]:
-                return
             await send_booking_confirmation(
                 to_email=ctx["patient_email"],
                 patient_name=ctx["patient_name"],
@@ -99,26 +104,35 @@ def notify_booking(db: AsyncSession, appointment_id):
                 session_date=ctx["session_date"],
                 slot_time=ctx["slot_time"],
                 slot_number=ctx["slot_number"],
+                appointment_id=ctx["appointment_id"],
+                duration_minutes=ctx.get("duration_minutes", 15),
             )
         except Exception as e:
-            logger.error("notify_booking error: %s", e)
+            logger.error("notify_booking send error: %s", e)
 
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_do())
+        loop.create_task(_send())
     except RuntimeError:
         pass
 
 
-def notify_cancellation(db: AsyncSession, appointment_id, reason: str = ""):
-    """Fire-and-forget: send cancellation email."""
-    async def _do():
+async def notify_cancellation(db: AsyncSession, appointment_id, reason: str = ""):
+    """
+    Fetch email context now (while db session is alive), then fire-and-forget the send.
+    """
+    try:
+        ctx = await _get_appointment_email_context(db, UUID(str(appointment_id)))
+        if not ctx or not ctx.get("patient_email"):
+            return
+        if "@dpms.local" in ctx["patient_email"]:
+            return
+    except Exception as e:
+        logger.error("notify_cancellation context error: %s", e)
+        return
+
+    async def _send():
         try:
-            ctx = await _get_appointment_email_context(db, UUID(str(appointment_id)))
-            if not ctx or not ctx["patient_email"]:
-                return
-            if "@dpms.local" in ctx["patient_email"]:
-                return
             await send_cancellation_email(
                 to_email=ctx["patient_email"],
                 patient_name=ctx["patient_name"],
@@ -126,13 +140,14 @@ def notify_cancellation(db: AsyncSession, appointment_id, reason: str = ""):
                 session_date=ctx["session_date"],
                 slot_time=ctx["slot_time"],
                 reason=reason,
+                appointment_id=ctx["appointment_id"],
             )
         except Exception as e:
-            logger.error("notify_cancellation error: %s", e)
+            logger.error("notify_cancellation send error: %s", e)
 
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_do())
+        loop.create_task(_send())
     except RuntimeError:
         pass
 

@@ -61,6 +61,7 @@ class UpdateDoctorRequest(BaseModel):
     consultation_fee: Optional[float] = None
     max_patients_per_slot: Optional[int] = None
     is_available: Optional[bool] = None
+    # full_name: Optional[str] = None 
 
 
 class UpdateConfigRequest(BaseModel):

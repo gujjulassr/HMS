@@ -115,26 +115,7 @@ async def _notify_patients_delay(
 ):
     """Notify all active patients about updated delay."""
     appointments = await _get_remaining_appointments(db, session.id)
-    for appt in appointments:
-        patient = await PatientModel.get_by_id(db, appt.patient_id)
-        if patient:
-            est_time = _slot_estimated_time(session, appt.slot_number, delay_minutes)
-            msg = (
-                f"Delay update: your doctor is running ~{delay_minutes} min behind. "
-                f"Your new estimated time is {est_time.strftime('%I:%M %p')}."
-            )
-            if reason:
-                msg += f" Reason: {reason}"
-            await NotificationModel.create(
-                db,
-                user_id=patient.user_id,
-                type="DELAY_UPDATE",
-                channel="in_app",
-                content=msg,
-                appointment_id=appt.id,
-            )
-
-    # Also send email notifications to all affected patients (fire-and-forget)
+    # Send email notifications to all affected patients (fire-and-forget)
     try:
         await notify_delay_for_session(db, session.id, delay_minutes)
     except Exception:
@@ -344,22 +325,8 @@ async def set_overtime_window(
         else:
             cannot_be_seen.append(affected)
 
-            # Notify patient who can't be seen
+            # Mark as needing notification (handled via email/UI)
             if patient:
-                await NotificationModel.create(
-                    db,
-                    user_id=patient.user_id,
-                    type="CANNOT_BE_SEEN",
-                    channel="in_app",
-                    content=(
-                        f"Due to delays, your doctor may not be able to see you today. "
-                        f"Your options: 1) Reschedule to another session, "
-                        f"2) Cancel with no penalty, "
-                        f"3) See another available doctor. "
-                        f"Please contact the front desk."
-                    ),
-                    appointment_id=appt.id,
-                )
                 affected.notification_sent = True
 
     await db.commit()
@@ -689,6 +656,8 @@ async def deactivate_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Doctor deactivates a session. Fails if any patient is currently in_progress."""
+
+    print(f"Deactivating session {body.session_id} with note: {body.note}")
     session = await SessionModel.get_by_id(db, UUID(body.session_id))
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")

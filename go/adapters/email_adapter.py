@@ -24,6 +24,15 @@ logger = logging.getLogger(__name__)
 # ─── Standardized email payload ────────────────────────────────
 
 @dataclass
+class EmailAttachment:
+    """A file to attach to an email."""
+    filename: str          # e.g., "appointment.ics"
+    content: bytes         # Raw file bytes
+    mime_type: str = "application/octet-stream"  # e.g., "text/calendar"
+    mime_subtype: str = ""  # e.g., "calendar" for text/calendar
+
+
+@dataclass
 class EmailPayload:
     """Provider-agnostic email payload."""
     to_email: str
@@ -32,6 +41,7 @@ class EmailPayload:
     plain_body: Optional[str] = None
     reply_to: Optional[str] = None
     tags: list[str] = field(default_factory=list)  # e.g., ["booking", "transactional"]
+    attachments: list[EmailAttachment] = field(default_factory=list)
 
 
 # ─── Abstract interface ───────────────────────────────────────
@@ -99,17 +109,41 @@ class GmailEmailAdapter(EmailAdapter):
             return False
 
         import aiosmtplib
+        from email.mime.base import MIMEBase
+        from email import encoders
 
-        msg = MIMEMultipart("alternative")
+        # Use "mixed" as outer type when we have attachments, so both
+        # the HTML body and the .ics file are included properly.
+        msg = MIMEMultipart("mixed")
         msg["From"] = f"{self._from_name} <{self._username}>"
         msg["To"] = payload.to_email
         msg["Subject"] = payload.subject
         if payload.reply_to:
             msg["Reply-To"] = payload.reply_to
 
+        # Text/HTML body goes inside an "alternative" sub-part
+        body_part = MIMEMultipart("alternative")
         if payload.plain_body:
-            msg.attach(MIMEText(payload.plain_body, "plain"))
-        msg.attach(MIMEText(payload.html_body, "html"))
+            body_part.attach(MIMEText(payload.plain_body, "plain"))
+        body_part.attach(MIMEText(payload.html_body, "html"))
+        msg.attach(body_part)
+
+        # Attachments
+        for att in payload.attachments:
+            if att.mime_type.startswith("text/"):
+                # Text-based attachments (e.g., text/calendar for .ics)
+                sub = att.mime_subtype or att.mime_type.split("/")[-1]
+                part = MIMEText(att.content.decode("utf-8"), _subtype=sub)
+                part.add_header("Content-Disposition", "attachment", filename=att.filename)
+                # For .ics files, set the method so calendar apps auto-process
+                if sub == "calendar":
+                    part.set_param("method", "REQUEST")
+            else:
+                part = MIMEBase(*att.mime_type.split("/", 1))
+                part.set_payload(att.content)
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", "attachment", filename=att.filename)
+            msg.attach(part)
 
         try:
             await aiosmtplib.send(

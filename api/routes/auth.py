@@ -147,30 +147,31 @@ async def google_callback(
     # Step 2: Find existing user — no auto-registration
     user = await UserModel.get_by_email(db, oauth_user.email)
 
+    import urllib.parse
+    import os
+    _streamlit_url = os.getenv("STREAMLIT_URL", "http://localhost:8501")
+
     if not user:
         # Redirect back to Streamlit with an error — user must register first
-        import urllib.parse
         params = urllib.parse.urlencode({
             "google_login_error": "No account found. Please register first, then use Google login.",
         })
-        return RedirectResponse(f"http://localhost:8501/?{params}")
+        return RedirectResponse(f"{_streamlit_url}/?{params}")
 
     if not user.is_active:
-        import urllib.parse
         params = urllib.parse.urlencode({
             "google_login_error": "Account is deactivated. Contact admin.",
         })
-        return RedirectResponse(f"http://localhost:8501/?{params}")
+        return RedirectResponse(f"{_streamlit_url}/?{params}")
 
     # Step 3: Create JWT tokens and redirect to Streamlit
     tokens = create_tokens(user)
-    import urllib.parse
     params = urllib.parse.urlencode({
         "access_token": tokens["access_token"],
         "refresh_token": tokens["refresh_token"],
         "google_login": "1",
     })
-    return RedirectResponse(f"http://localhost:8501/?{params}")
+    return RedirectResponse(f"{_streamlit_url}/?{params}")
 
 
 # ─── POST /refresh ───────────────────────────────────────────

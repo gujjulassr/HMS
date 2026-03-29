@@ -66,9 +66,17 @@ def _db_get_sessions_by_doctor_id(doctor_id: str, date_str: str) -> list[dict]:
     import psycopg2.extras
     import uuid as _uuid_mod
     try:
+        from config import get_settings as _get_settings
+        _s = _get_settings()
+        # Parse DB credentials from DATABASE_URL in config
+        import re as _re
+        _m = _re.search(r'://([^:]+):([^@]+)@([^:/]+):?(\d+)?/(.+)', _s.DATABASE_URL)
         conn = psycopg2.connect(
-            host="localhost", port=5432, dbname="dpms_v2",
-            user="postgres", password="postgres",
+            host=_m.group(3) if _m else "localhost",
+            port=int(_m.group(4)) if _m and _m.group(4) else 5432,
+            dbname=_m.group(5) if _m else "dpms_v2",
+            user=_m.group(1) if _m else "postgres",
+            password=_m.group(2) if _m else "postgres",
         )
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
@@ -159,9 +167,17 @@ def _db_get_all_sessions_for_doctor(user_id: str, date_str: str) -> list[dict]:
     import psycopg2.extras
     import uuid as _uuid_mod
     try:
+        from config import get_settings as _get_settings
+        _s = _get_settings()
+        # Parse DB credentials from DATABASE_URL in config
+        import re as _re
+        _m = _re.search(r'://([^:]+):([^@]+)@([^:/]+):?(\d+)?/(.+)', _s.DATABASE_URL)
         conn = psycopg2.connect(
-            host="localhost", port=5432, dbname="dpms_v2",
-            user="postgres", password="postgres",
+            host=_m.group(3) if _m else "localhost",
+            port=int(_m.group(4)) if _m and _m.group(4) else 5432,
+            dbname=_m.group(5) if _m else "dpms_v2",
+            user=_m.group(1) if _m else "postgres",
+            password=_m.group(2) if _m else "postgres",
         )
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
@@ -606,7 +622,7 @@ def page_patient_dashboard():
     if abha:
         info_parts.append(f"🆔 ABHA: {abha}")
     if full_profile and full_profile.get("emergency_contact_name"):
-        info_parts.append(f"🚨 Emergency: {full_profile['emergency_contact_name']}")
+        info_parts.append(f"🚨 Emergency: {full_profile.get('emergency_contact_name', '')}")
     if info_parts:
         st.caption("  |  ".join(info_parts))
 
@@ -645,7 +661,7 @@ def page_patient_dashboard():
     st.subheader("Upcoming Appointments")
     try:
         appts = api.get_my_appointments().get("appointments", [])
-        active = [a for a in appts if a["status"] in ("booked", "checked_in", "in_progress")]
+        active = [a for a in appts if a.get("status") in ("booked", "checked_in", "in_progress")]
         if not active:
             st.info("No upcoming appointments. Use '📅 Book Appointment' to schedule one!")
         for a in active:
@@ -656,8 +672,8 @@ def page_patient_dashboard():
                 appt_time = a.get("start_time", "")
                 if appt_time:
                     appt_time = str(appt_time)[:5]
-                row1c2.write(f"📅 {appt_date}  •  🕐 {appt_time}  •  Slot {a['slot_number']}")
-                row1c3.write(_status_badge(a["status"]))
+                row1c2.write(f"📅 {appt_date}  •  🕐 {appt_time}  •  Slot {a.get('slot_number', '?')}")
+                row1c3.write(_status_badge(a.get("status", "unknown")))
                 if a.get("delay_minutes", 0) > 0:
                     st.warning(f"⏱️ Doctor running ~{a['delay_minutes']} min late. Expected wait adjusted accordingly.")
                 if a.get("notes"):
@@ -876,9 +892,9 @@ def page_my_appointments():
         return
 
     # Summary counts
-    active_list = [a for a in appts if a["status"] in ("booked", "checked_in", "in_progress")]
-    completed_list = [a for a in appts if a["status"] == "completed"]
-    cancelled_list = [a for a in appts if a["status"] in ("cancelled", "no_show")]
+    active_list = [a for a in appts if a.get("status") in ("booked", "checked_in", "in_progress")]
+    completed_list = [a for a in appts if a.get("status") == "completed"]
+    cancelled_list = [a for a in appts if a.get("status") in ("cancelled", "no_show")]
     mc1, mc2, mc3, mc4 = st.columns(4)
     mc1.metric("Total", len(appts))
     mc2.metric("Active", len(active_list))
@@ -890,7 +906,7 @@ def page_my_appointments():
     for group_name, statuses in [("🟢 Active Appointments", ["in_progress", "checked_in", "booked"]),
                                   ("✅ Completed Visits", ["completed"]),
                                   ("❌ Cancelled / No-Show", ["cancelled", "no_show"])]:
-        group = [a for a in appts if a["status"] in statuses]
+        group = [a for a in appts if a.get("status") in statuses]
         if not group:
             continue
         st.subheader(group_name)
@@ -899,8 +915,8 @@ def page_my_appointments():
                 c1, c2, c3 = st.columns([3, 3, 1])
                 c1.write(f"**🩺 {a.get('doctor_name', 'Doctor')}** — {a.get('specialization', '')}")
                 appt_time = str(a.get("start_time", ""))[:5]
-                c2.write(f"📅 {a.get('session_date', '')}  •  🕐 {appt_time}  •  Slot {a['slot_number']}")
-                c3.write(_status_badge(a["status"]))
+                c2.write(f"📅 {a.get('session_date', '')}  •  🕐 {appt_time}  •  Slot {a.get('slot_number', '?')}")
+                c3.write(_status_badge(a.get("status", "unknown")))
                 # Additional info row
                 info_bits = []
                 if a.get("priority_tier"):
@@ -922,28 +938,30 @@ def page_my_appointments():
                 except Exception:
                     appt_is_past = False
 
-                if a["status"] in ("booked", "checked_in") and not appt_is_past:
-                    if st.button("❌ Cancel Appointment", key=f"cancel_{a['appointment_id']}",
+                _appt_status = a.get("status", "")
+                _appt_id = a.get("appointment_id", "")
+                if _appt_status in ("booked", "checked_in") and not appt_is_past:
+                    if st.button("❌ Cancel Appointment", key=f"cancel_{_appt_id}",
                                   help="Warning: cancelling affects your risk score"):
                         try:
-                            r = api.cancel_appointment({"appointment_id": a["appointment_id"], "reason": "Cancelled via dashboard"})
-                            st.warning(f"Cancelled. Risk penalty: +{r['risk_delta']}  •  New score: {r['new_risk_score']}")
+                            r = api.cancel_appointment({"appointment_id": _appt_id, "reason": "Cancelled via dashboard"})
+                            st.warning(f"Cancelled. Risk penalty: +{r.get('risk_delta', 0)}  •  New score: {r.get('new_risk_score', '?')}")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Failed: {e}")
-                elif a["status"] in ("booked", "checked_in") and appt_is_past:
+                elif _appt_status in ("booked", "checked_in") and appt_is_past:
                     st.caption("⏰ Past appointment — cannot cancel.")
 
-                if a["status"] == "cancelled" and not appt_is_past:
-                    if st.button("↩ Undo Cancel — Rebook", key=f"undo_cancel_{a['appointment_id']}",
+                if _appt_status == "cancelled" and not appt_is_past:
+                    if st.button("↩ Undo Cancel — Rebook", key=f"undo_cancel_{_appt_id}",
                                   help="Changed your mind? Restore this appointment and reverse risk penalty."):
                         try:
-                            r = api.undo_cancel({"appointment_id": a["appointment_id"], "reason": "Patient undid cancellation"})
+                            r = api.undo_cancel({"appointment_id": _appt_id, "reason": "Patient undid cancellation"})
                             st.success(f"↩ Appointment restored! Risk reversed by {r.get('risk_reversed', 0)} points.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Failed: {e}")
-                elif a["status"] == "cancelled" and appt_is_past:
+                elif _appt_status == "cancelled" and appt_is_past:
                     st.caption("⏰ Past appointment — cannot rebook.")
 
 
@@ -2735,7 +2753,7 @@ def page_staff_session():
                         r = api.checkin_patient(payload)
                         st.success(f"✅ {name} checked in — #{r['queue_position']}")
                     elif pending == "cancel":
-                        r = api.cancel_appointment({"appointment_id": appt_id, "reason": "Cancelled by nurse"})
+                        r = api.staff_cancel_appointment({"appointment_id": appt_id, "reason": "Cancelled by nurse"})
                         st.warning(f"✖ {name} cancelled.")
                     elif pending == "noshow":
                         r = api.mark_no_shows({"session_id": session_id})
@@ -3547,48 +3565,91 @@ def page_nurse_patients():
                     nbk_doc_idx = st.selectbox("Doctor", range(len(nbk_doc_labels)),
                                                 format_func=lambda i: nbk_doc_labels[i], key=f"nbk_doc_{pid}")
                     nbk_doc = nbk_docs[nbk_doc_idx]
-                    try:
-                        nbk_sessions = api.get_doctor_sessions(nbk_doc["doctor_id"])
-                        nbk_active = [s for s in nbk_sessions if s["status"] == "active"]
-                    except Exception:
-                        nbk_active = []
-                    if not nbk_active:
-                        st.info("No active sessions.")
+
+                    # ── Date picker — nurse can book for any date ──
+                    from datetime import date as _nbk_d, timedelta as _nbk_td
+                    nbk_date_opts = ["Today", "Tomorrow", "This Week", "Next Week", "Custom Date"]
+                    nbk_date_choice = st.selectbox("📅 Date Range", nbk_date_opts, key=f"nbk_date_{pid}")
+                    _nbk_today = _nbk_d.today()
+                    if nbk_date_choice == "Today":
+                        nbk_from, nbk_to = _nbk_today, _nbk_today
+                    elif nbk_date_choice == "Tomorrow":
+                        nbk_from = nbk_to = _nbk_today + _nbk_td(days=1)
+                    elif nbk_date_choice == "This Week":
+                        nbk_from, nbk_to = _nbk_today, _nbk_today + _nbk_td(days=6)
+                    elif nbk_date_choice == "Next Week":
+                        nbk_from = _nbk_today + _nbk_td(days=7)
+                        nbk_to = _nbk_today + _nbk_td(days=13)
                     else:
-                        nbk_sess_labels = [
-                            f"{s['session_date']} • {str(s.get('start_time', ''))[:5]}–{str(s.get('end_time', ''))[:5]} • {s.get('available_capacity', '?')} slots"
-                            for s in nbk_active
-                        ]
+                        nbk_from = st.date_input("From", value=_nbk_today, key=f"nbk_from_{pid}")
+                        nbk_to = st.date_input("To", value=_nbk_today + _nbk_td(days=7), key=f"nbk_to_{pid}")
+
+                    # Load ALL sessions for the date range
+                    try:
+                        nbk_sessions = api.get_doctor_sessions(
+                            nbk_doc["doctor_id"],
+                            from_date=str(nbk_from),
+                            to_date=str(nbk_to),
+                            include_all=True,
+                        )
+                        nbk_bookable = [s for s in nbk_sessions if s.get("status") in ("active", "inactive")]
+                    except Exception:
+                        nbk_bookable = []
+                    if not nbk_bookable:
+                        st.info(f"No sessions found for {nbk_doc['full_name']} in the selected date range. "
+                                f"The doctor may not have sessions scheduled, or all sessions are completed/cancelled.")
+                    else:
+                        def _nbk_sess_label(s):
+                            tag = ""
+                            if s.get("status") == "inactive":
+                                tag = " ⚪ INACTIVE"
+                            cap = s.get('available_capacity', '?')
+                            return (f"{s['session_date']} • "
+                                    f"{str(s.get('start_time', ''))[:5]}–{str(s.get('end_time', ''))[:5]} • "
+                                    f"{cap} slots avail{tag}")
+
+                        nbk_sess_labels = [_nbk_sess_label(s) for s in nbk_bookable]
                         nbk_sess_idx = st.selectbox("Session", range(len(nbk_sess_labels)),
                                                      format_func=lambda i: nbk_sess_labels[i], key=f"nbk_sess_{pid}")
-                        nbk_sess = nbk_active[nbk_sess_idx]
-                        nbk_total = nbk_sess.get("total_slots", 1)
-                        nbk_dur = nbk_sess.get("slot_duration_minutes", 15)
-                        nbk_start = str(nbk_sess.get("start_time", "09:00"))
-                        nbk_slot_opts = []
-                        for si in range(1, nbk_total + 1):
-                            try:
-                                hh, mm = int(nbk_start[:2]), int(nbk_start[3:5])
-                                t_min = hh * 60 + mm + (si - 1) * nbk_dur
-                                t_str = f"{t_min // 60:02d}:{t_min % 60:02d}"
-                            except Exception:
-                                t_str = f"Slot {si}"
-                            nbk_slot_opts.append(f"Slot {si} — {t_str}")
-                        nbk_slot_idx = st.selectbox("Time Slot", range(len(nbk_slot_opts)),
-                                                     format_func=lambda i: nbk_slot_opts[i], key=f"nbk_slot_{pid}")
-                        nbk_slot_num = nbk_slot_idx + 1
-                        st.caption(f"**Patient:** {nbk_name}  •  **Doctor:** {nbk_doc['full_name']}  •  **Slot:** {nbk_slot_opts[nbk_slot_idx]}")
-                        if st.button("✅ Confirm Booking", key=f"nbk_confirm_{pid}", type="primary", use_container_width=True):
-                            try:
-                                api.staff_book({
-                                    "session_id": nbk_sess["session_id"],
-                                    "patient_id": nbk_pid,
-                                    "slot_number": nbk_slot_num,
-                                })
-                                st.session_state["nurse_pat_msg"] = f"Booked for {nbk_name} with {nbk_doc['full_name']}"
-                                st.rerun()
-                            except Exception as ex:
-                                st.error(f"Booking failed: {ex}")
+                        nbk_sess = nbk_bookable[nbk_sess_idx]
+
+                        if nbk_sess.get("status") == "inactive":
+                            st.warning("⚪ This session is **inactive**. Activate it first, or ask the doctor to activate from their dashboard.")
+                            if st.button("🟢 Activate & Continue", key=f"nbk_activate_{pid}"):
+                                try:
+                                    api.activate_session({"session_id": nbk_sess["session_id"]})
+                                    st.success("Session activated!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed: {e}")
+                        else:
+                            nbk_total = nbk_sess.get("total_slots", 1)
+                            nbk_dur = nbk_sess.get("slot_duration_minutes", 15)
+                            nbk_start = str(nbk_sess.get("start_time", "09:00"))
+                            nbk_slot_opts = []
+                            for si in range(1, nbk_total + 1):
+                                try:
+                                    hh, mm = int(nbk_start[:2]), int(nbk_start[3:5])
+                                    t_min = hh * 60 + mm + (si - 1) * nbk_dur
+                                    t_str = f"{t_min // 60:02d}:{t_min % 60:02d}"
+                                except Exception:
+                                    t_str = f"Slot {si}"
+                                nbk_slot_opts.append(f"Slot {si} — {t_str}")
+                            nbk_slot_idx = st.selectbox("Time Slot", range(len(nbk_slot_opts)),
+                                                         format_func=lambda i: nbk_slot_opts[i], key=f"nbk_slot_{pid}")
+                            nbk_slot_num = nbk_slot_idx + 1
+                            st.caption(f"**Patient:** {nbk_name}  •  **Doctor:** {nbk_doc['full_name']}  •  **Slot:** {nbk_slot_opts[nbk_slot_idx]}")
+                            if st.button("✅ Confirm Booking", key=f"nbk_confirm_{pid}", type="primary", use_container_width=True):
+                                try:
+                                    api.staff_book({
+                                        "session_id": nbk_sess["session_id"],
+                                        "patient_id": nbk_pid,
+                                        "slot_number": nbk_slot_num,
+                                    })
+                                    st.session_state["nurse_pat_msg"] = f"Booked for {nbk_name} with {nbk_doc['full_name']}"
+                                    st.rerun()
+                                except Exception as ex:
+                                    st.error(f"Booking failed: {ex}")
 
             # Edit profile
             with na2.popover("✏️ Update Info", use_container_width=True):
@@ -3892,11 +3953,19 @@ def page_admin_doctors():
                         st.error(f"{e}")
 
                 with ac2.popover("✏️ Edit Settings"):
+                    # doctor_name = st.text_input("Doctor Name", value=doc.get("full_name") or "", key=f"ed_name_{did}")
                     ed_fee = st.number_input("Fee (₹)", 0, 10000, fee_val, key=f"ed_fee_{did}")
                     ed_max = st.number_input("Max/Slot", 1, 10, max_val, key=f"ed_max_{did}")
                     ed_spec = st.text_input("Specialization", doc.get("specialization") or "", key=f"ed_spec_{did}")
                     if st.button("Save", key=f"ed_save_{did}", type="primary", use_container_width=True):
                         updates = {}
+
+
+                        # if doctor_name!= (doc.get("full_name") or ""):
+                        #     updates["full_name"] = doctor_name
+
+
+
                         if ed_fee != fee_val:
                             updates["consultation_fee"] = ed_fee
                         if ed_max != max_val:
@@ -4137,7 +4206,7 @@ def page_admin_patients():
                             bc1, bc2 = ac4.columns(2)
                             if bc1.button("✖ Cancel", key=f"adm_cx_{a_id}", use_container_width=True):
                                 try:
-                                    api.cancel_appointment({"appointment_id": a_id, "reason": "Cancelled by admin"})
+                                    api.staff_cancel_appointment({"appointment_id": a_id, "reason": "Cancelled by admin"})
                                     st.session_state["admin_msg"] = f"Cancelled appointment for {name}"
                                     st.rerun()
                                 except Exception as ex:
@@ -4206,53 +4275,94 @@ def page_admin_patients():
                     bk_doc_idx = st.selectbox("Doctor", range(len(bk_doc_labels)),
                                                format_func=lambda i: bk_doc_labels[i], key=f"bk_doc_{pid}")
                     bk_doc = bk_docs[bk_doc_idx]
-                    # Load sessions
-                    try:
-                        bk_sessions = api.get_doctor_sessions(bk_doc["doctor_id"])
-                        bk_active = [s for s in bk_sessions if s["status"] == "active"]
-                    except Exception:
-                        bk_active = []
-                    if not bk_active:
-                        st.info("No active sessions for this doctor.")
+
+                    # ── Date picker — admin can book for any date ──
+                    from datetime import date as _bk_d, timedelta as _bk_td
+                    bk_date_opts = ["Today", "Tomorrow", "This Week", "Next Week", "Custom Date"]
+                    bk_date_choice = st.selectbox("📅 Date Range", bk_date_opts, key=f"bk_date_{pid}")
+                    _bk_today = _bk_d.today()
+                    if bk_date_choice == "Today":
+                        bk_from, bk_to = _bk_today, _bk_today
+                    elif bk_date_choice == "Tomorrow":
+                        bk_from = bk_to = _bk_today + _bk_td(days=1)
+                    elif bk_date_choice == "This Week":
+                        bk_from, bk_to = _bk_today, _bk_today + _bk_td(days=6)
+                    elif bk_date_choice == "Next Week":
+                        bk_from = _bk_today + _bk_td(days=7)
+                        bk_to = _bk_today + _bk_td(days=13)
                     else:
-                        bk_sess_labels = [
-                            f"{s['session_date']} • {str(s.get('start_time', ''))[:5]}–{str(s.get('end_time', ''))[:5]} • {s.get('available_capacity', '?')} slots"
-                            for s in bk_active
-                        ]
+                        bk_from = st.date_input("From", value=_bk_today, key=f"bk_from_{pid}")
+                        bk_to = st.date_input("To", value=_bk_today + _bk_td(days=7), key=f"bk_to_{pid}")
+
+                    # Load ALL sessions (active + inactive) for the date range
+                    try:
+                        bk_sessions = api.get_doctor_sessions(
+                            bk_doc["doctor_id"],
+                            from_date=str(bk_from),
+                            to_date=str(bk_to),
+                            include_all=True,
+                        )
+                        # Show active and inactive (staff can activate inactive)
+                        bk_bookable = [s for s in bk_sessions if s.get("status") in ("active", "inactive")]
+                    except Exception:
+                        bk_bookable = []
+                    if not bk_bookable:
+                        st.info(f"No sessions found for {bk_doc['full_name']} in the selected date range. "
+                                f"The doctor may not have sessions scheduled, or all sessions are completed/cancelled.")
+                    else:
+                        def _bk_sess_label(s):
+                            tag = ""
+                            if s.get("status") == "inactive":
+                                tag = " ⚪ INACTIVE"
+                            cap = s.get('available_capacity', '?')
+                            return (f"{s['session_date']} • "
+                                    f"{str(s.get('start_time', ''))[:5]}–{str(s.get('end_time', ''))[:5]} • "
+                                    f"{cap} slots avail{tag}")
+
+                        bk_sess_labels = [_bk_sess_label(s) for s in bk_bookable]
                         bk_sess_idx = st.selectbox("Session", range(len(bk_sess_labels)),
                                                     format_func=lambda i: bk_sess_labels[i], key=f"bk_sess_{pid}")
-                        bk_sess = bk_active[bk_sess_idx]
-                        bk_total = bk_sess.get("total_slots", 1)
-                        bk_dur = bk_sess.get("slot_duration_minutes", 15)
-                        bk_start = str(bk_sess.get("start_time", "09:00"))
-                        # Slot picker
-                        bk_slot_opts = []
-                        for si in range(1, bk_total + 1):
-                            try:
-                                hh, mm = int(bk_start[:2]), int(bk_start[3:5])
-                                t_min = hh * 60 + mm + (si - 1) * bk_dur
-                                t_str = f"{t_min // 60:02d}:{t_min % 60:02d}"
-                            except Exception:
-                                t_str = f"Slot {si}"
-                            bk_slot_opts.append(f"Slot {si} — {t_str}")
-                        bk_slot_idx = st.selectbox("Time Slot", range(len(bk_slot_opts)),
-                                                    format_func=lambda i: bk_slot_opts[i], key=f"bk_slot_{pid}")
-                        bk_slot_num = bk_slot_idx + 1
+                        bk_sess = bk_bookable[bk_sess_idx]
 
-                        # Summary
-                        st.caption(f"**Patient:** {bk_patient_name}  •  **Doctor:** {bk_doc['full_name']}  •  **Slot:** {bk_slot_opts[bk_slot_idx]}")
+                        if bk_sess.get("status") == "inactive":
+                            st.warning("⚪ This session is **inactive**. You need to activate it first, or ask the doctor to activate it from their dashboard.")
+                            if st.button("🟢 Activate & Continue", key=f"bk_activate_{pid}"):
+                                try:
+                                    api.activate_session({"session_id": bk_sess["session_id"]})
+                                    st.success("Session activated!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed: {e}")
+                        else:
+                            bk_total = bk_sess.get("total_slots", 1)
+                            bk_dur = bk_sess.get("slot_duration_minutes", 15)
+                            bk_start = str(bk_sess.get("start_time", "09:00"))
+                            bk_slot_opts = []
+                            for si in range(1, bk_total + 1):
+                                try:
+                                    hh, mm = int(bk_start[:2]), int(bk_start[3:5])
+                                    t_min = hh * 60 + mm + (si - 1) * bk_dur
+                                    t_str = f"{t_min // 60:02d}:{t_min % 60:02d}"
+                                except Exception:
+                                    t_str = f"Slot {si}"
+                                bk_slot_opts.append(f"Slot {si} — {t_str}")
+                            bk_slot_idx = st.selectbox("Time Slot", range(len(bk_slot_opts)),
+                                                        format_func=lambda i: bk_slot_opts[i], key=f"bk_slot_{pid}")
+                            bk_slot_num = bk_slot_idx + 1
 
-                        if st.button("✅ Confirm Booking", key=f"bk_confirm_{pid}", type="primary", use_container_width=True):
-                            try:
-                                result = api.staff_book({
-                                    "session_id": bk_sess["session_id"],
-                                    "patient_id": bk_patient_id,
-                                    "slot_number": bk_slot_num,
-                                })
-                                st.session_state["admin_msg"] = f"Appointment booked for {bk_patient_name} with {bk_doc['full_name']}"
-                                st.rerun()
-                            except Exception as ex:
-                                st.error(f"Booking failed: {ex}")
+                            st.caption(f"**Patient:** {bk_patient_name}  •  **Doctor:** {bk_doc['full_name']}  •  **Slot:** {bk_slot_opts[bk_slot_idx]}")
+
+                            if st.button("✅ Confirm Booking", key=f"bk_confirm_{pid}", type="primary", use_container_width=True):
+                                try:
+                                    result = api.staff_book({
+                                        "session_id": bk_sess["session_id"],
+                                        "patient_id": bk_patient_id,
+                                        "slot_number": bk_slot_num,
+                                    })
+                                    st.session_state["admin_msg"] = f"Appointment booked for {bk_patient_name} with {bk_doc['full_name']}"
+                                    st.rerun()
+                                except Exception as ex:
+                                    st.error(f"Booking failed: {ex}")
 
             # Risk reset
             with act2.popover("🔧 Reset Risk", use_container_width=True):
@@ -4386,6 +4496,47 @@ def page_admin_sessions():
                     booked = s.get("booked_count", "0")
                     total = s.get("total_slots", "0")
                     delay = s.get("delay_minutes", "0")
+
+                    col1,col2,col3 = st.columns(3)
+                    session_id = s.get("session_id") or s.get("id")
+                    status_norm=str(status).lower()
+
+                    # st.caption(f"Session ID: {session_id}  •  Status: {status_norm}")
+
+                    # st.write(f"🔍 session_id type: {type(session_id)} | value: {repr(session_id)}")
+                    # st.write(f"🔍 status type: {type(status)} | value: {repr(status)}")
+                    # st.write(f"🔍 status_norm type: {type(status_norm)} | value: {repr(status_norm)}")
+
+                    
+
+
+
+                    with col1:
+                        if status_norm=='active':
+                            if st.button("🟢 DeActivate", key=f"activate_{session_id}", use_container_width=True):
+                                try:
+                                    api.deactivate_session({"session_id": session_id})
+                                    st.session_state["admin_msg"] = f"Session {session_id} deactivated"
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"{e}")
+
+                        elif status_norm=='inactive':
+                            if st.button("🔄 Activate", key=f"deactivate_{session_id}", use_container_width=True):
+                                try:
+                                    api.activate_session({"session_id": session_id})
+                                    st.session_state["admin_msg"] = f"Session {session_id} activated"
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"{e}")
+                        else:
+                            st.write(f"Status: {status_norm.title()}")
+
+                    # st.caption(f"Debug session_id: {session_id}")
+
+                    
+
+                    
 
                     detail = f"{booked}/{total} booked"
                     if str(delay) != "0":
