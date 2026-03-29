@@ -19,12 +19,14 @@ class Settings(BaseSettings):
     # ─── Google OAuth ─────────────────────────────────────
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_REDIRECT_URI: str = "http://127.0.0.1:8000/api/auth/google/callback"
 
-    # ─── Email Adapter ────────────────────────────────────
+    # ─── Email Adapter (Gmail SMTP) ────────────────────────
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
-    SMTP_USERNAME: str = ""
-    SMTP_PASSWORD: str = ""
+    SMTP_USERNAME: str = ""          # your-gmail@gmail.com
+    SMTP_PASSWORD: str = ""          # Gmail App Password (not regular password)
+    EMAIL_FROM_NAME: str = "HMS Hospital"
 
     # ─── SMS Adapter (Twilio) ─────────────────────────────
     TWILIO_ACCOUNT_SID: str = ""

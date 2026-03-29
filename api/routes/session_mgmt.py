@@ -29,6 +29,7 @@ from lo.models.appointment import Appointment, AppointmentModel
 from lo.models.notification_log import NotificationModel
 from lo.models.booking_audit_log import AuditModel
 from go.services.booking_service import cancel_session_appointments
+from go.services.notification_dispatcher import notify_delay_for_session, notify_session_cancelled
 from api.schemas.session_schemas import (
     DoctorCheckinRequest,
     UpdateDelayRequest,
@@ -132,6 +133,12 @@ async def _notify_patients_delay(
                 content=msg,
                 appointment_id=appt.id,
             )
+
+    # Also send email notifications to all affected patients (fire-and-forget)
+    try:
+        await notify_delay_for_session(db, session.id, delay_minutes)
+    except Exception:
+        pass  # Email failures never block the core flow
 
 
 # ─── POST /checkin — doctor arrives ──────────────────────────
@@ -743,6 +750,11 @@ async def cancel_session_route(
             performed_by_user_id=user.id,
             reason=body.reason,
         )
+        # Send cancellation emails to all affected patients (fire-and-forget)
+        try:
+            await notify_session_cancelled(db, UUID(body.session_id), reason=body.reason or "")
+        except Exception:
+            pass  # Email failures never block the core flow
         return CancelSessionResponse(
             status=result["status"], message=result["message"],
             appointments_cancelled=result["appointments_cancelled"],

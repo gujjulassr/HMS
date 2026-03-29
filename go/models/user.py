@@ -25,6 +25,21 @@ class User:
     updated_at: datetime
 
 
+# Explicit column list — avoids SELECT * breakage when schema evolves
+_USER_COLS = (
+    "id, email, phone, password_hash, full_name, role, "
+    "google_id, is_active, created_at, updated_at"
+)
+
+
+def _row_to_user(row) -> User:
+    """Safely convert a RowMapping to a User dataclass."""
+    d = dict(row)
+    # Handle case where google_id column doesn't exist yet
+    d.setdefault("google_id", None)
+    return User(**d)
+
+
 class UserModel:
 
     @staticmethod
@@ -53,7 +68,7 @@ class UserModel:
             },
         )
         row = result.mappings().one()
-        return User(**row)
+        return _row_to_user(row)
 
     @staticmethod
     async def get_by_id(db: AsyncSession, user_id: UUID) -> Optional[User]:
@@ -62,16 +77,16 @@ class UserModel:
             {"id": user_id},
         )
         row = result.mappings().first()
-        return User(**row) if row else None
+        return _row_to_user(row) if row else None
 
     @staticmethod
     async def get_by_email(db: AsyncSession, email: str) -> Optional[User]:
         result = await db.execute(
-            text("SELECT * FROM users WHERE email = :email AND is_active = true"),
+            text("SELECT * FROM users WHERE email = :email"),
             {"email": email},
         )
         row = result.mappings().first()
-        return User(**row) if row else None
+        return _row_to_user(row) if row else None
 
     @staticmethod
     async def get_by_google_id(db: AsyncSession, google_id: str) -> Optional[User]:
@@ -80,7 +95,7 @@ class UserModel:
             {"google_id": google_id},
         )
         row = result.mappings().first()
-        return User(**row) if row else None
+        return _row_to_user(row) if row else None
 
     @staticmethod
     async def update(db: AsyncSession, user_id: UUID, **fields) -> Optional[User]:
@@ -94,7 +109,7 @@ class UserModel:
             fields,
         )
         row = result.mappings().first()
-        return User(**row) if row else None
+        return _row_to_user(row) if row else None
 
     @staticmethod
     async def deactivate(db: AsyncSession, user_id: UUID) -> bool:

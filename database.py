@@ -48,13 +48,31 @@ async def get_db() -> AsyncSession:
 
 async def init_db():
     """
-    Called on startup to verify database connection.
+    Called on startup to verify database connection and apply auto-migrations.
     Does NOT create tables — use migrations for that.
     """
     async with engine.begin() as conn:
         from sqlalchemy import text
         await conn.execute(text("SELECT 1"))
         print("[DB] Connection verified successfully")
+
+        # ── Auto-migrations (safe to re-run) ──────────────────
+        # Drop UNIQUE on phone — family members can share numbers
+        await conn.execute(text(
+            "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_phone_key"
+        ))
+        # Drop UNIQUE on abha_id — same UHID may be re-submitted on profile save
+        await conn.execute(text(
+            "ALTER TABLE patients DROP CONSTRAINT IF EXISTS patients_abha_id_key"
+        ))
+        # Add google_id column if missing (for OAuth support)
+        await conn.execute(text("""
+            DO $$ BEGIN
+                ALTER TABLE users ADD COLUMN google_id VARCHAR(255) UNIQUE;
+            EXCEPTION WHEN duplicate_column THEN NULL;
+            END $$
+        """))
+        print("[DB] Auto-migrations applied")
 
 
 async def close_db():

@@ -18,9 +18,16 @@ Key patterns:
 """
 import streamlit as st
 import sys, os
+import base64
 
 sys.path.insert(0, os.path.dirname(__file__))
 from streamlit_pages import api_client as api
+
+try:
+    from audio_recorder_streamlit import audio_recorder
+    HAS_AUDIO_RECORDER = True
+except ImportError:
+    HAS_AUDIO_RECORDER = False
 
 st.set_page_config(page_title="DPMS v2", page_icon="🏥", layout="wide", initial_sidebar_state="expanded")
 
@@ -428,6 +435,12 @@ def _status_badge(status: str) -> str:
 def show_login():
     st.title("🏥 DPMS v2")
     st.caption("Doctor-Patient Management System")
+
+    # Show Google login error if redirected back
+    google_err = st.session_state.pop("_google_error", None)
+    if google_err:
+        st.error(google_err)
+
     tab_login, tab_register = st.tabs(["Login", "Register"])
 
     with tab_login:
@@ -448,6 +461,27 @@ def show_login():
             except Exception as e:
                 st.error(f"Login failed: {e}")
         st.divider()
+        # Google OAuth login
+        st.markdown(
+            '<a href="http://127.0.0.1:8000/api/auth/google/login" target="_self" '
+            'style="display:inline-flex;align-items:center;gap:8px;padding:10px 24px;'
+            'background:#fff;border:1px solid #dadce0;border-radius:8px;color:#3c4043;'
+            'font-size:14px;font-weight:500;text-decoration:none;cursor:pointer;'
+            'width:100%;justify-content:center;box-sizing:border-box;">'
+            '<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" '
+            'd="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 '
+            '14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>'
+            '<path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94'
+            'c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>'
+            '<path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14'
+            '.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>'
+            '<path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 '
+            '1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 '
+            '14.62 48 24 48z"/></svg>'
+            'Sign in with Google</a>',
+            unsafe_allow_html=True,
+        )
+        st.divider()
         st.caption("Test accounts — password: `password123`")
         st.code("ravi.kumar@gmail.com      (patient)\npriya.sharma@gmail.com    (patient)\ndr.ananya@hospital.com    (doctor)\nnurse.lakshmi@hospital.com (nurse)\nadmin@hospital.com        (admin)", language=None)
 
@@ -458,7 +492,9 @@ def show_login():
             reg_password = st.text_input("Password", type="password", key="reg_pass")
             c1, c2 = st.columns(2)
             with c1:
-                dob = st.date_input("Date of Birth")
+                from datetime import date as _reg_d
+                dob = st.date_input("Date of Birth", value=_reg_d(1990, 1, 1),
+                                     min_value=_reg_d(1920, 1, 1), max_value=_reg_d.today())
             with c2:
                 gender = st.selectbox("Gender", ["male", "female", "other"])
             phone = st.text_input("Phone (optional)", key="reg_phone")
@@ -501,6 +537,7 @@ def show_sidebar():
                        "doctor_session": "⚙️ Session Controls",
                        "chatbot": "🤖 AI Assistant"},
             "nurse": {"dashboard": "🏠 Dashboard", "staff_session": "📋 Session & Queue",
+                      "nurse_patients": "🏥 Patient Lookup",
                       "nurse_emergency": "🚨 Emergency Book",
                       "chatbot": "🤖 AI Assistant"},
             "admin": {
@@ -540,84 +577,275 @@ def page_patient_dashboard():
         st.rerun()
     user = st.session_state.user
     patient = st.session_state.patient
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Name", user["full_name"])
-    c2.metric("Risk Score", patient["risk_score"] if patient else "N/A")
-    c3.metric("Blood Group", patient.get("blood_group", "—") if patient else "—")
 
+    # ── Load full profile for richer info ──
+    full_profile = None
+    try:
+        full_profile = api.get_my_profile()
+    except Exception:
+        pass
+
+    # ── Patient info card ──
+    with st.container(border=True):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Name", user["full_name"])
+        c2.metric("Gender", (patient.get("gender") or "—").title() if patient else "—")
+        c3.metric("Blood Group", patient.get("blood_group") or "—" if patient else "—")
+        age_val = full_profile.get("age", "—") if full_profile else "—"
+        c4.metric("Age", age_val)
+        risk = patient.get("risk_score", 0) if patient else 0
+        risk_label = "Low" if risk < 20 else ("Medium" if risk < 50 else "High")
+        c5.metric("Risk Score", f"{risk} ({risk_label})")
+
+    # ── Quick info row ──
+    info_parts = []
+    phone = (full_profile or {}).get("phone") or user.get("phone")
+    if phone:
+        info_parts.append(f"📞 {phone}")
+    abha = (patient or {}).get("abha_id")
+    if abha:
+        info_parts.append(f"🆔 ABHA: {abha}")
+    if full_profile and full_profile.get("emergency_contact_name"):
+        info_parts.append(f"🚨 Emergency: {full_profile['emergency_contact_name']}")
+    if info_parts:
+        st.caption("  |  ".join(info_parts))
+
+    # Warn if profile is incomplete
+    if full_profile:
+        missing = []
+        if not full_profile.get("abha_id"):
+            missing.append("UHID (ABHA ID)")
+        if not full_profile.get("phone"):
+            missing.append("phone")
+        if not full_profile.get("blood_group"):
+            missing.append("blood group")
+        if not full_profile.get("emergency_contact_name"):
+            missing.append("emergency contact")
+        if missing:
+            st.warning(f"⚠️ Your profile is incomplete — please add: {', '.join(missing)}. Go to 👤 My Profile to update.")
+
+    # ── Quick actions ──
+    st.divider()
+    qa1, qa2, qa3 = st.columns(3)
+    with qa1:
+        if st.button("📅 Book New Appointment", use_container_width=True, type="primary"):
+            st.session_state.page = "book"
+            st.rerun()
+    with qa2:
+        if st.button("📋 View All Appointments", use_container_width=True):
+            st.session_state.page = "my_appointments"
+            st.rerun()
+    with qa3:
+        if st.button("🤖 Chat with AI Assistant", use_container_width=True):
+            st.session_state.page = "chatbot"
+            st.rerun()
+
+    # ── Upcoming / Active appointments ──
     st.divider()
     st.subheader("Upcoming Appointments")
     try:
         appts = api.get_my_appointments().get("appointments", [])
         active = [a for a in appts if a["status"] in ("booked", "checked_in", "in_progress")]
         if not active:
-            st.info("No upcoming appointments. Use '📅 Book Appointment' in the sidebar!")
+            st.info("No upcoming appointments. Use '📅 Book Appointment' to schedule one!")
         for a in active:
             with st.container(border=True):
-                c1, c2, c3 = st.columns([3, 2, 1])
-                c1.write(f"**{a.get('doctor_name', 'Doctor')}** — {a.get('specialization', '')}")
-                c2.write(f"📅 {a.get('session_date', '')}  •  Slot {a['slot_number']}")
-                c3.write(_status_badge(a["status"]))
+                row1c1, row1c2, row1c3 = st.columns([3, 3, 1])
+                row1c1.write(f"**🩺 {a.get('doctor_name', 'Doctor')}** — {a.get('specialization', '')}")
+                appt_date = a.get("session_date", "")
+                appt_time = a.get("start_time", "")
+                if appt_time:
+                    appt_time = str(appt_time)[:5]
+                row1c2.write(f"📅 {appt_date}  •  🕐 {appt_time}  •  Slot {a['slot_number']}")
+                row1c3.write(_status_badge(a["status"]))
                 if a.get("delay_minutes", 0) > 0:
-                    st.warning(f"⏱️ Doctor running {a['delay_minutes']} min late")
+                    st.warning(f"⏱️ Doctor running ~{a['delay_minutes']} min late. Expected wait adjusted accordingly.")
+                if a.get("notes"):
+                    st.caption(f"📝 {a['notes']}")
+
+        # Show recent completed
+        completed = [a for a in appts if a["status"] == "completed"][:3]
+        if completed:
+            st.divider()
+            st.subheader("Recent Visits")
+            for a in completed:
+                with st.container(border=True):
+                    rc1, rc2, rc3 = st.columns([3, 3, 1])
+                    rc1.write(f"**{a.get('doctor_name', 'Doctor')}** — {a.get('specialization', '')}")
+                    rc2.write(f"📅 {a.get('session_date', '')}")
+                    rc3.write("✅ Completed")
+                    if a.get("notes"):
+                        st.caption(f"📝 {a['notes']}")
     except Exception as e:
-        st.error(f"Could not load: {e}")
+        st.error(f"Could not load appointments: {e}")
+
+
+def _calc_slot_time(start_time_str: str, slot_duration: int, slot_num: int) -> str:
+    """Calculate the actual time for a given slot number."""
+    try:
+        parts = str(start_time_str).split(":")
+        start_h, start_m = int(parts[0]), int(parts[1])
+        total_minutes = start_h * 60 + start_m + (slot_num - 1) * slot_duration
+        h, m = divmod(total_minutes, 60)
+        return f"{h:02d}:{m:02d}"
+    except Exception:
+        return f"Slot {slot_num}"
 
 
 def page_book_appointment():
-    st.title("📅 Book an Appointment")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("📅 Book an Appointment")
+    if tc2.button("🔄 Refresh", key="refresh_book", use_container_width=True):
+        st.rerun()
 
-    # Step 1: Pick doctor
-    st.subheader("Step 1 — Choose a Doctor")
-    spec = st.text_input("Filter by specialization (optional)", placeholder="e.g. Cardiology")
+    # ── Step 1: Department & Doctor selection ──
+    st.subheader("Step 1 — Choose Department & Doctor")
+
+    # Fetch departments for browsing
     try:
-        doctors = api.list_doctors(spec)
+        departments = api.list_departments()
+        if isinstance(departments, list) and departments:
+            if isinstance(departments[0], dict):
+                dept_list = [d.get("specialization", d.get("name", "")) for d in departments]
+            else:
+                dept_list = departments
+        else:
+            dept_list = []
+    except Exception:
+        dept_list = []
+
+    dc1, dc2 = st.columns([1, 2])
+    with dc1:
+        dept_options = ["All Departments"] + dept_list
+        selected_dept = st.selectbox("Department", dept_options, key="book_dept")
+        spec_filter = "" if selected_dept == "All Departments" else selected_dept
+
+    try:
+        doctors = api.list_doctors(spec_filter)
     except Exception as e:
         st.error(f"Could not load doctors: {e}"); return
     if not doctors:
-        st.info("No doctors found."); return
+        st.info("No doctors found for this department."); return
 
-    doc_labels = [f"{d['full_name']}  •  {d['specialization']}  •  ₹{d['consultation_fee']}" for d in doctors]
-    doc_idx = st.selectbox("Select doctor", range(len(doc_labels)), format_func=lambda i: doc_labels[i])
+    with dc2:
+        doc_labels = [
+            f"🩺 {d['full_name']}  •  {d['specialization']}  •  ⭐ {d.get('avg_rating', '—')}  •  ₹{d.get('consultation_fee', '—')}"
+            for d in doctors
+        ]
+        doc_idx = st.selectbox("Select Doctor", range(len(doc_labels)), format_func=lambda i: doc_labels[i])
     selected_doc = doctors[doc_idx]
 
-    # Step 2: Pick session
+    # Show doctor info card
+    with st.container(border=True):
+        di1, di2, di3, di4 = st.columns(4)
+        di1.write(f"**Doctor:** {selected_doc['full_name']}")
+        di2.write(f"**Specialization:** {selected_doc['specialization']}")
+        di3.write(f"**Fee:** ₹{selected_doc.get('consultation_fee', '—')}")
+        di4.write(f"**Rating:** ⭐ {selected_doc.get('avg_rating', '—')}")
+
+    # ── Step 2: Pick session ──
     st.divider()
-    st.subheader(f"Step 2 — Pick a Session with {selected_doc['full_name']}")
+    st.subheader(f"Step 2 — Pick a Session")
     try:
         sessions = api.get_doctor_sessions(selected_doc["doctor_id"])
         active_sessions = [s for s in sessions if s["status"] == "active"]
     except Exception as e:
         st.error(f"Could not load sessions: {e}"); return
     if not active_sessions:
-        st.info("No available sessions."); return
+        st.info(f"No available sessions for {selected_doc['full_name']}. Try another doctor."); return
 
-    sess_labels = [f"📅 {s['session_date']}  •  {s['start_time'][:5]}–{s['end_time'][:5]}  •  {s['available_capacity']} slots free" for s in active_sessions]
+    sess_labels = []
+    for s in active_sessions:
+        start = str(s.get("start_time", ""))[:5]
+        end = str(s.get("end_time", ""))[:5]
+        avail = s.get("available_capacity", s.get("total_slots", 0) - s.get("booked_count", 0))
+        sess_labels.append(f"📅 {s['session_date']}  •  🕐 {start}–{end}  •  {avail} slots free")
     sess_idx = st.selectbox("Select session", range(len(sess_labels)), format_func=lambda i: sess_labels[i])
     selected_sess = active_sessions[sess_idx]
 
-    # Step 3: Slot + patient
+    # ── Step 3: Slot selection with time display ──
     st.divider()
-    st.subheader("Step 3 — Choose Slot & Patient")
-    slot_num = st.number_input("Slot Number", min_value=1, max_value=selected_sess["total_slots"], value=1,
-                                help=f"Total slots: {selected_sess['total_slots']}")
+    st.subheader("Step 3 — Choose Time Slot")
 
-    # Beneficiary picker
+    total_slots = selected_sess.get("total_slots", 1)
+    slot_duration = selected_sess.get("slot_duration_minutes", 15)
+    start_time = str(selected_sess.get("start_time", "09:00"))
+
+    # Build slot options with times
+    slot_options = []
+    for i in range(1, total_slots + 1):
+        slot_time = _calc_slot_time(start_time, slot_duration, i)
+        slot_options.append(f"Slot {i} — {slot_time}")
+
+    selected_slot_idx = st.selectbox("Pick a time slot", range(len(slot_options)),
+                                      format_func=lambda i: slot_options[i])
+    slot_num = selected_slot_idx + 1
+
+    # ── Step 4: Who is this appointment for? ──
+    st.divider()
+    st.subheader("Step 4 — Who is this appointment for?")
+
+    # Load existing family members
     try:
         rels = api.get_my_relationships()
         approved = [r for r in rels if r["is_approved"]]
     except Exception:
         approved = []
 
-    if approved:
-        ben_labels = [f"{r.get('beneficiary_name', '?')} ({r['relationship_type']})" for r in approved]
-        ben_idx = st.selectbox("Booking for", range(len(ben_labels)), format_func=lambda i: ben_labels[i])
-        beneficiary_id = approved[ben_idx]["beneficiary_patient_id"]
-    else:
-        beneficiary_id = st.session_state.patient["id"] if st.session_state.patient else ""
-        st.info("Booking for yourself")
+    self_id = st.session_state.patient["id"] if st.session_state.patient else ""
 
-    if st.button("✅ Confirm Booking", type="primary", use_container_width=True):
+    # Build booking-for options
+    booking_options = ["Myself"]
+    family_map = {}  # index -> beneficiary_patient_id
+    for r in approved:
+        if r["relationship_type"] == "self":
+            continue
+        label = f"{r.get('beneficiary_name', '?')} ({r['relationship_type'].title()})"
+        booking_options.append(label)
+        family_map[len(booking_options) - 1] = r["beneficiary_patient_id"]
+
+    booking_choice = st.radio("Booking for", booking_options, horizontal=True, key="book_for_radio")
+    booking_idx = booking_options.index(booking_choice)
+
+    my_name = st.session_state.user.get("full_name", "Me") if st.session_state.user else "Me"
+
+    if booking_idx == 0:
+        # Booking for self
+        beneficiary_id = self_id
+        selected_beneficiary_name = my_name
+    elif booking_idx in family_map:
+        # Booking for existing family member
+        beneficiary_id = family_map[booking_idx]
+        selected_beneficiary_name = booking_choice.split(" (")[0]
+        st.caption(f"Booking on behalf of **{selected_beneficiary_name}**")
+    else:
+        beneficiary_id = self_id
+        selected_beneficiary_name = my_name
+
+    # ── Step 5: Symptoms ──
+    st.divider()
+    st.subheader("Step 5 — Reason for Visit")
+    symptoms = st.text_area("Symptoms / Reason for Visit *",
+                             placeholder="Describe your symptoms or reason for visiting (e.g., persistent headache for 3 days, fever, chest pain...)",
+                             height=80)
+    if not symptoms:
+        st.caption("⚠️ Please describe your symptoms — this helps the doctor prepare for your visit.")
+
+    # ── Booking summary & confirm ──
+    st.divider()
+    slot_time_str = _calc_slot_time(start_time, slot_duration, slot_num)
+    with st.container(border=True):
+        st.markdown("**📋 Booking Summary**")
+        sc1, sc2 = st.columns(2)
+        sc1.write(f"**Patient:** {selected_beneficiary_name}")
+        sc1.write(f"**Doctor:** {selected_doc['full_name']} ({selected_doc['specialization']})")
+        sc2.write(f"**Date:** {selected_sess['session_date']}  •  **Time:** {slot_time_str}")
+        sc2.write(f"**Fee:** ₹{selected_doc.get('consultation_fee', '—')}")
+        if symptoms:
+            st.caption(f"**Symptoms:** {symptoms[:100]}{'...' if len(symptoms) > 100 else ''}")
+
+    if st.button("✅ Confirm Booking", type="primary", use_container_width=True,
+                  disabled=not symptoms.strip()):
         try:
             result = api.book_appointment({
                 "session_id": selected_sess["session_id"],
@@ -626,6 +854,7 @@ def page_book_appointment():
             })
             if result["status"] == "booked":
                 st.success(f"✅ {result['message']}")
+                st.balloons()
             else:
                 st.warning(f"⏳ {result['message']}")
         except Exception as e:
@@ -633,48 +862,81 @@ def page_book_appointment():
 
 
 def page_my_appointments():
-    st.title("📋 My Appointments")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("📋 My Appointments")
+    if tc2.button("🔄 Refresh", key="refresh_my_appts", use_container_width=True):
+        st.rerun()
+
     try:
         appts = api.get_my_appointments().get("appointments", [])
     except Exception as e:
         st.error(f"Could not load: {e}"); return
     if not appts:
-        st.info("No appointments yet."); return
+        st.info("No appointments yet. Book your first appointment from the sidebar!")
+        return
 
-    for group_name, statuses in [("Active", ["in_progress", "checked_in", "booked"]),
-                                  ("Past", ["completed", "cancelled", "no_show"])]:
+    # Summary counts
+    active_list = [a for a in appts if a["status"] in ("booked", "checked_in", "in_progress")]
+    completed_list = [a for a in appts if a["status"] == "completed"]
+    cancelled_list = [a for a in appts if a["status"] in ("cancelled", "no_show")]
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("Total", len(appts))
+    mc2.metric("Active", len(active_list))
+    mc3.metric("Completed", len(completed_list))
+    mc4.metric("Cancelled", len(cancelled_list))
+
+    st.divider()
+
+    for group_name, statuses in [("🟢 Active Appointments", ["in_progress", "checked_in", "booked"]),
+                                  ("✅ Completed Visits", ["completed"]),
+                                  ("❌ Cancelled / No-Show", ["cancelled", "no_show"])]:
         group = [a for a in appts if a["status"] in statuses]
         if not group:
             continue
         st.subheader(group_name)
         for a in group:
             with st.container(border=True):
-                c1, c2, c3 = st.columns([3, 2, 1])
-                c1.write(f"**{a.get('doctor_name', 'Doctor')}** — {a.get('specialization', '')}")
-                c2.write(f"📅 {a.get('session_date', '')}  •  Slot {a['slot_number']}  •  {a['priority_tier']}")
+                c1, c2, c3 = st.columns([3, 3, 1])
+                c1.write(f"**🩺 {a.get('doctor_name', 'Doctor')}** — {a.get('specialization', '')}")
+                appt_time = str(a.get("start_time", ""))[:5]
+                c2.write(f"📅 {a.get('session_date', '')}  •  🕐 {appt_time}  •  Slot {a['slot_number']}")
                 c3.write(_status_badge(a["status"]))
+                # Additional info row
+                info_bits = []
+                if a.get("priority_tier"):
+                    info_bits.append(f"Priority: {a['priority_tier']}")
+                if a.get("is_emergency"):
+                    info_bits.append("🚨 Emergency")
+                if a.get("delay_minutes", 0) > 0:
+                    info_bits.append(f"⏱️ Delay: ~{a['delay_minutes']} min")
+                if info_bits:
+                    st.caption("  |  ".join(info_bits))
                 if a.get("notes"):
-                    st.caption(f"Notes: {a['notes']}")
-                # Cancel — only if session hasn't passed
+                    st.caption(f"📝 Notes: {a['notes']}")
+
+                # Actions
                 appt_date_str = a.get("session_date", "")
                 try:
                     from datetime import date as _pd
-                    appt_is_past = _pd.fromisoformat(appt_date_str) < _pd.today() if appt_date_str else False
+                    appt_is_past = _pd.fromisoformat(str(appt_date_str)) < _pd.today() if appt_date_str else False
                 except Exception:
                     appt_is_past = False
+
                 if a["status"] in ("booked", "checked_in") and not appt_is_past:
-                    if st.button("Cancel this appointment", key=f"cancel_{a['appointment_id']}"):
+                    if st.button("❌ Cancel Appointment", key=f"cancel_{a['appointment_id']}",
+                                  help="Warning: cancelling affects your risk score"):
                         try:
                             r = api.cancel_appointment({"appointment_id": a["appointment_id"], "reason": "Cancelled via dashboard"})
-                            st.warning(f"Cancelled. Risk: +{r['risk_delta']}  •  New score: {r['new_risk_score']}")
+                            st.warning(f"Cancelled. Risk penalty: +{r['risk_delta']}  •  New score: {r['new_risk_score']}")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Failed: {e}")
                 elif a["status"] in ("booked", "checked_in") and appt_is_past:
                     st.caption("⏰ Past appointment — cannot cancel.")
-                # Undo cancel — only if session is still today or future
+
                 if a["status"] == "cancelled" and not appt_is_past:
-                    if st.button("↩ Undo Cancel — Rebook", key=f"undo_cancel_{a['appointment_id']}", help="Changed your mind? Restore this appointment."):
+                    if st.button("↩ Undo Cancel — Rebook", key=f"undo_cancel_{a['appointment_id']}",
+                                  help="Changed your mind? Restore this appointment and reverse risk penalty."):
                         try:
                             r = api.undo_cancel({"appointment_id": a["appointment_id"], "reason": "Patient undid cancellation"})
                             st.success(f"↩ Appointment restored! Risk reversed by {r.get('risk_reversed', 0)} points.")
@@ -686,42 +948,317 @@ def page_my_appointments():
 
 
 def page_patient_profile():
-    st.title("👤 My Profile")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("👤 My Profile")
+    if tc2.button("🔄 Refresh", key="refresh_profile", use_container_width=True):
+        st.rerun()
     try:
         p = api.get_my_profile()
     except Exception as e:
         st.error(f"Could not load: {e}"); return
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.write(f"**Name:** {p['full_name']}")
-        st.write(f"**Email:** {p['email']}")
-        st.write(f"**Phone:** {p.get('phone') or '—'}")
-        st.write(f"**DOB:** {p['date_of_birth']} (Age: {p['age']})")
-    with c2:
-        st.write(f"**Blood Group:** {p.get('blood_group') or '—'}")
-        st.write(f"**Risk Score:** {p['risk_score']}")
-        st.write(f"**ABHA:** {p.get('abha_id') or '—'}")
-        st.write(f"**Emergency:** {p.get('emergency_contact_name') or '—'}")
+    # ── Personal details card ──
+    with st.container(border=True):
+        st.markdown("**Personal Information**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.write(f"**Name:** {p['full_name']}")
+            st.write(f"**Email:** {p['email']}")
+            st.write(f"**Phone:** {p.get('phone') or '⚠️ Not set'}")
+        with c2:
+            st.write(f"**Date of Birth:** {p['date_of_birth']}")
+            st.write(f"**Age:** {p['age']} years")
+            st.write(f"**Gender:** {p.get('gender', '—').title()}")
+        with c3:
+            st.write(f"**Blood Group:** {p.get('blood_group') or '⚠️ Not set'}")
+            st.write(f"**ABHA ID:** {p.get('abha_id') or '—'}")
+            risk = p.get('risk_score', 0)
+            risk_color = "🟢" if risk < 20 else ("🟡" if risk < 50 else "🔴")
+            st.write(f"**Risk Score:** {risk_color} {risk}")
 
+    # ── Emergency contact card ──
+    with st.container(border=True):
+        st.markdown("**Emergency Contact**")
+        ec1, ec2, ec3 = st.columns(3)
+        ec1.write(f"**Name:** {p.get('emergency_contact_name') or '⚠️ Not set'}")
+        ec2.write(f"**Phone:** {p.get('emergency_contact_phone') or '⚠️ Not set'}")
+        ec3.write(f"**Address:** {p.get('address') or '⚠️ Not set'}")
+
+    # ── Check for missing required fields ──
+    missing = []
+    if not p.get("phone"):
+        missing.append("Phone number")
+    if not p.get("blood_group"):
+        missing.append("Blood group")
+    if not p.get("emergency_contact_name"):
+        missing.append("Emergency contact name")
+    if not p.get("emergency_contact_phone"):
+        missing.append("Emergency contact phone")
+    if missing:
+        st.warning(f"⚠️ Please complete your profile — missing: {', '.join(missing)}")
+
+    # ── Update form ──
     st.divider()
     st.subheader("Update Profile")
     with st.form("update_profile"):
-        new_phone = st.text_input("Phone", value=p.get("phone") or "")
-        new_blood = st.text_input("Blood Group", value=p.get("blood_group") or "")
-        new_addr = st.text_input("Address", value=p.get("address") or "")
-        if st.form_submit_button("Save"):
+        uc1, uc2 = st.columns(2)
+        with uc1:
+            new_phone = st.text_input("Phone Number", value=p.get("phone") or "",
+                                       placeholder="e.g. 9876543210")
+            new_blood = st.selectbox("Blood Group",
+                                      options=["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"],
+                                      index=["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"].index(p.get("blood_group") or ""))
+            new_abha = st.text_input("ABHA ID", value=p.get("abha_id") or "",
+                                      placeholder="14-digit ABHA number")
+        with uc2:
+            new_emergency_name = st.text_input("Emergency Contact Name",
+                                                value=p.get("emergency_contact_name") or "",
+                                                placeholder="e.g. Rahul Kumar")
+            new_emergency_phone = st.text_input("Emergency Contact Phone",
+                                                 value=p.get("emergency_contact_phone") or "",
+                                                 placeholder="e.g. 9876543210")
+            new_addr = st.text_input("Address", value=p.get("address") or "",
+                                      placeholder="e.g. 123 MG Road, Bangalore")
+
+        if st.form_submit_button("💾 Save Changes", use_container_width=True, type="primary"):
             payload = {}
             if new_phone: payload["phone"] = new_phone
             if new_blood: payload["blood_group"] = new_blood
+            if new_abha: payload["abha_id"] = new_abha
+            if new_emergency_name: payload["emergency_contact_name"] = new_emergency_name
+            if new_emergency_phone: payload["emergency_contact_phone"] = new_emergency_phone
             if new_addr: payload["address"] = new_addr
             if payload:
                 try:
                     api.update_my_profile(payload)
-                    st.success("Saved!")
+                    st.success("✅ Profile updated!")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed: {e}")
+            else:
+                st.info("No changes to save.")
+
+    # ── Family Members / Beneficiaries ──
+    st.divider()
+    st.subheader("👨‍👩‍👧‍👦 Family Members (Book for Others)")
+    st.caption("Add family members here so you can book appointments on their behalf.")
+
+    # Show existing relationships
+    try:
+        rels = api.get_my_relationships()
+        approved = [r for r in rels if r["is_approved"]]
+        pending = [r for r in rels if not r["is_approved"]]
+    except Exception:
+        rels, approved, pending = [], [], []
+
+    family_count = 0
+
+    def _show_family_card(r, status_icon, status_label, idx):
+        """Render a single family member card with full details and edit option."""
+        rel_id = r.get("relationship_id", "")
+        edit_key = f"edit_fam_{rel_id}"
+
+        with st.container(border=True):
+            # Header row: name, relationship, status, edit button
+            fc1, fc2, fc3, fc4 = st.columns([3, 2, 1, 1])
+            fc1.write(f"**{r.get('beneficiary_name', 'Unknown')}**")
+            fc2.write(f"Relation: {r['relationship_type'].title()}")
+            fc3.write(f"{status_icon} {status_label}")
+            if fc4.button("✏️ Edit", key=f"btn_edit_{idx}"):
+                st.session_state[edit_key] = not st.session_state.get(edit_key, False)
+                st.rerun()
+
+            # Detail rows — show whatever is available
+            details = []
+            if r.get("beneficiary_gender"):
+                details.append(f"**Gender:** {r['beneficiary_gender'].title()}")
+            if r.get("beneficiary_age") is not None:
+                details.append(f"**Age:** {r['beneficiary_age']}")
+            if r.get("beneficiary_blood_group"):
+                details.append(f"**Blood Group:** {r['beneficiary_blood_group']}")
+            if r.get("beneficiary_phone"):
+                details.append(f"**Phone:** {r['beneficiary_phone']}")
+            if r.get("beneficiary_abha_id"):
+                details.append(f"**UHID:** {r['beneficiary_abha_id']}")
+            if r.get("beneficiary_address"):
+                details.append(f"**Address:** {r['beneficiary_address']}")
+            if r.get("beneficiary_emergency_contact_name"):
+                ec = r['beneficiary_emergency_contact_name']
+                if r.get("beneficiary_emergency_contact_phone"):
+                    ec += f" ({r['beneficiary_emergency_contact_phone']})"
+                details.append(f"**Emergency Contact:** {ec}")
+
+            if details:
+                st.caption(" · ".join(details))
+
+            # ── Inline edit form ──
+            if st.session_state.get(edit_key, False):
+                from datetime import date as _ed
+                st.markdown("---")
+                with st.form(f"edit_fam_form_{idx}"):
+                    ec1, ec2 = st.columns(2)
+                    with ec1:
+                        ed_name = st.text_input(
+                            "Full Name", value=r.get("beneficiary_name") or "",
+                            key=f"ed_name_{idx}")
+                        ed_phone = st.text_input(
+                            "Phone", value=r.get("beneficiary_phone") or "",
+                            key=f"ed_phone_{idx}")
+                        _rel_opts = ["spouse", "parent", "child", "sibling", "guardian", "other"]
+                        _cur_rel = r.get("relationship_type", "other")
+                        _rel_idx = _rel_opts.index(_cur_rel) if _cur_rel in _rel_opts else 5
+                        ed_rel = st.selectbox(
+                            "Relationship", _rel_opts, index=_rel_idx,
+                            key=f"ed_rel_{idx}")
+                        ed_address = st.text_input(
+                            "Address", value=r.get("beneficiary_address") or "",
+                            key=f"ed_addr_{idx}")
+                    with ec2:
+                        _genders = ["male", "female", "other"]
+                        _cur_g = (r.get("beneficiary_gender") or "other").lower()
+                        _g_idx = _genders.index(_cur_g) if _cur_g in _genders else 2
+                        ed_gender = st.selectbox(
+                            "Gender", _genders, index=_g_idx,
+                            key=f"ed_gender_{idx}")
+                        _dob_val = None
+                        if r.get("beneficiary_date_of_birth"):
+                            try:
+                                _dob_val = _ed.fromisoformat(str(r["beneficiary_date_of_birth"]))
+                            except Exception:
+                                _dob_val = _ed(1990, 1, 1)
+                        else:
+                            _dob_val = _ed(1990, 1, 1)
+                        ed_dob = st.date_input(
+                            "Date of Birth", value=_dob_val,
+                            min_value=_ed(1920, 1, 1), max_value=_ed.today(),
+                            key=f"ed_dob_{idx}")
+                        _bg_opts = ["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"]
+                        _cur_bg = r.get("beneficiary_blood_group") or ""
+                        _bg_idx = _bg_opts.index(_cur_bg) if _cur_bg in _bg_opts else 0
+                        ed_blood = st.selectbox(
+                            "Blood Group", _bg_opts, index=_bg_idx,
+                            key=f"ed_blood_{idx}")
+                        ed_ec_name = st.text_input(
+                            "Emergency Contact Name",
+                            value=r.get("beneficiary_emergency_contact_name") or "",
+                            key=f"ed_ecn_{idx}")
+                        ed_ec_phone = st.text_input(
+                            "Emergency Contact Phone",
+                            value=r.get("beneficiary_emergency_contact_phone") or "",
+                            key=f"ed_ecp_{idx}")
+
+                    b1, b2 = st.columns(2)
+                    ed_save = b1.form_submit_button("💾 Save Changes", type="primary")
+                    ed_cancel = b2.form_submit_button("Cancel")
+
+                if ed_cancel:
+                    st.session_state[edit_key] = False
+                    st.rerun()
+
+                if ed_save:
+                    payload = {}
+                    if ed_name.strip() and ed_name.strip() != (r.get("beneficiary_name") or ""):
+                        payload["full_name"] = ed_name.strip()
+                    if ed_phone.strip() != (r.get("beneficiary_phone") or ""):
+                        payload["phone"] = ed_phone.strip()
+                    if ed_gender != (r.get("beneficiary_gender") or "other").lower():
+                        payload["gender"] = ed_gender
+                    if str(ed_dob) != str(r.get("beneficiary_date_of_birth") or ""):
+                        payload["date_of_birth"] = str(ed_dob)
+                    if ed_blood != (r.get("beneficiary_blood_group") or ""):
+                        payload["blood_group"] = ed_blood
+                    if ed_address.strip() != (r.get("beneficiary_address") or ""):
+                        payload["address"] = ed_address.strip()
+                    if ed_ec_name.strip() != (r.get("beneficiary_emergency_contact_name") or ""):
+                        payload["emergency_contact_name"] = ed_ec_name.strip()
+                    if ed_ec_phone.strip() != (r.get("beneficiary_emergency_contact_phone") or ""):
+                        payload["emergency_contact_phone"] = ed_ec_phone.strip()
+                    if ed_rel != r.get("relationship_type", "other"):
+                        payload["relationship_type"] = ed_rel
+
+                    if not payload:
+                        st.info("No changes detected.")
+                    else:
+                        try:
+                            api.update_family_member(rel_id, payload)
+                            st.success("✅ Family member updated!")
+                            st.session_state[edit_key] = False
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed: {e}")
+
+    if approved:
+        for i, r in enumerate(approved):
+            if r.get("relationship_type") == "self":
+                continue
+            family_count += 1
+            _show_family_card(r, "✅", "Linked", i)
+
+    if pending:
+        for i, r in enumerate(pending):
+            if r.get("relationship_type") == "self":
+                continue
+            family_count += 1
+            _show_family_card(r, "⏳", "Pending", len(approved) + i)
+
+    if family_count == 0:
+        st.info("No family members added yet. Use the form below to add one.")
+
+    # Add new family member — enter their details directly
+    st.markdown("---")
+    st.markdown("**Add a Family Member**")
+
+    # ── UHID gate: patient must have their own ABHA/UHID before linking family ──
+    my_uhid = p.get("abha_id")
+    if not my_uhid:
+        st.warning(
+            "⚠️ You must set your own UHID (ABHA ID) in the profile form above "
+            "before you can add family members. This is needed to establish the "
+            "relationship between your records."
+        )
+        return  # stop here — don't show the family form
+
+    st.caption("Enter their details below. They'll be registered and linked to your account so you can book for them.")
+
+    with st.form("add_family_form"):
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            fam_name = st.text_input("Full Name *", placeholder="e.g. Sunita Kumar")
+            fam_phone = st.text_input("Phone Number", placeholder="e.g. 9876543210")
+            fam_relationship = st.selectbox("Relationship *",
+                                             ["spouse", "parent", "child", "sibling", "guardian", "other"])
+        with fc2:
+            from datetime import date as _fam_d
+            fam_dob = st.date_input("Date of Birth", value=_fam_d(1990, 1, 1),
+                                     min_value=_fam_d(1920, 1, 1), max_value=_fam_d.today(),
+                                     key="fam_dob")
+            fam_gender = st.selectbox("Gender", ["male", "female", "other"], key="fam_gender")
+            fam_blood = st.selectbox("Blood Group",
+                                      ["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"],
+                                      key="fam_blood")
+
+        fam_submitted = st.form_submit_button("👨‍👩‍👧 Add Family Member", use_container_width=True, type="primary")
+
+    if fam_submitted:
+        if not fam_name or len(fam_name.strip()) < 2:
+            st.error("Please enter the family member's full name.")
+        else:
+            try:
+                payload = {
+                    "full_name": fam_name.strip(),
+                    "relationship_type": fam_relationship,
+                    "gender": fam_gender,
+                    "date_of_birth": str(fam_dob),
+                }
+                if fam_phone:
+                    payload["phone"] = fam_phone.strip()
+                if fam_blood:
+                    payload["blood_group"] = fam_blood
+                result = api.add_family_member(payload)
+                st.success(f"✅ {result.get('beneficiary_name', fam_name)} added as {fam_relationship}! You can now book appointments for them.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to add family member: {e}")
 
 
 # ════════════════════════════════════════════════════════════
@@ -793,9 +1330,9 @@ def page_doctor_dashboard():
     """
     from datetime import date as _dd, time as _time_cls
 
-    st.title("Doctor Dashboard")
-
-    if st.button("Refresh", key="refresh_doc_dash"):
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("🩺 Doctor Dashboard")
+    if tc2.button("🔄 Refresh", key="refresh_doc_dash", use_container_width=True):
         st.rerun()
 
     # ── Step 1: Date picker (persisted across refresh) ──
@@ -2804,7 +3341,10 @@ def page_staff_session():
 # ════════════════════════════════════════════════════════════
 
 def page_nurse_emergency():
-    st.title("🚨 Emergency Booking")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("🚨 Emergency Booking")
+    if tc2.button("🔄 Refresh", key="refresh_nurse_emg", use_container_width=True):
+        st.rerun()
     st.warning("Bypasses rate limits & risk scores. Only for real emergencies.")
 
     session_id = _smart_session_picker("emg_sp")
@@ -2853,6 +3393,228 @@ def page_nurse_emergency():
 
 
 # ════════════════════════════════════════════════════════════
+# NURSE / ADMIN — PATIENT MANAGEMENT
+# ════════════════════════════════════════════════════════════
+
+def page_nurse_patients():
+    """Nurse patient management — search, view details, book appointments, update profiles."""
+    from datetime import date as _d
+
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("🏥 Patient Lookup")
+    if tc2.button("🔄 Refresh", key="refresh_nurse_pat", use_container_width=True):
+        st.rerun()
+
+    if st.session_state.get("nurse_pat_msg"):
+        st.success(st.session_state.pop("nurse_pat_msg"))
+
+    # ── Filters ──
+    fc1, fc2 = st.columns([3, 1])
+    search = fc1.text_input("🔍 Search", key="nurse_pat_search", placeholder="Name, phone, or ABHA...")
+    high_risk = fc2.checkbox("High risk only", key="nurse_pat_hr")
+
+    try:
+        patients = api.admin_list_patients(
+            search=search if search and len(search) >= 2 else "",
+            high_risk_only=high_risk,
+        )
+    except Exception as e:
+        st.error(f"Failed: {e}"); return
+
+    if not patients:
+        st.info("No patients found."); return
+
+    st.caption(f"Showing {len(patients)} patients")
+
+    for p in patients:
+        pid = str(p["patient_id"])
+        try:
+            risk = float(p.get("risk_score") or 0)
+        except (ValueError, TypeError):
+            risk = 0.0
+        risk_dot = "🟢" if risk < 3 else "🟡" if risk < 7 else "🔴"
+        total_appt = int(p.get("total_appointments") or 0)
+        no_shows = int(p.get("no_shows") or 0)
+
+        age_str = ""
+        if p.get("date_of_birth") and p["date_of_birth"] != "None":
+            try:
+                dob = _d.fromisoformat(str(p["date_of_birth"])[:10])
+                age_str = f"{(_d.today() - dob).days // 365}y"
+            except Exception:
+                pass
+        gender_str = (p.get("gender") or "—")[:1].upper() if p.get("gender") and p["gender"] != "None" else "—"
+        name = p.get("full_name", "—")
+
+        header = (
+            f"{risk_dot} **{name}**  •  {age_str}/{gender_str}  "
+            f"•  📞 {p.get('phone') or '—'}  •  🩸 {p.get('blood_group') or '—'}  "
+            f"•  Visits: {total_appt}"
+        )
+
+        with st.expander(header, expanded=False):
+            # Load full detail
+            try:
+                detail = api.admin_get_patient(pid)
+            except Exception as e:
+                st.error(f"Could not load: {e}"); continue
+
+            # ── Patient info (two columns) ──
+            d1, d2 = st.columns(2)
+            with d1:
+                with st.container(border=True):
+                    st.markdown("**Personal Info**")
+                    st.write(f"**Name:** {detail.get('full_name', '—')}")
+                    st.write(f"**Phone:** {detail.get('phone') or '⚠️ Not set'}")
+                    st.write(f"**DOB:** {detail.get('date_of_birth', '—')}  •  **Age:** {age_str}")
+                    st.write(f"**Gender:** {(detail.get('gender') or '—').title()}")
+                    st.write(f"**Blood Group:** {detail.get('blood_group') or '⚠️ Not set'}")
+                    st.write(f"**ABHA/UHID:** {detail.get('abha_id') or '⚠️ Not set'}")
+            with d2:
+                with st.container(border=True):
+                    st.markdown("**Emergency Contact**")
+                    st.write(f"**Name:** {detail.get('emergency_contact_name') or '⚠️ Not set'}")
+                    st.write(f"**Phone:** {detail.get('emergency_contact_phone') or '⚠️ Not set'}")
+                    st.write(f"**Address:** {detail.get('address') or '⚠️ Not set'}")
+                    st.write(f"**Risk Score:** {risk_dot} {risk:.1f}")
+
+            # ── Family members ──
+            rels = detail.get("relationships", [])
+            if rels:
+                st.markdown("**👨‍👩‍👧‍👦 Family Members**")
+                for r in rels:
+                    rc1, rc2 = st.columns([3, 2])
+                    rc1.write(f"**{r.get('beneficiary_name', '—')}**")
+                    rc2.write(f"{(r.get('relationship_type') or '—').title()}")
+
+            # ── Appointment history (last 10) ──
+            appts = detail.get("appointments", [])
+            if appts:
+                st.markdown(f"**📋 Recent Appointments** ({len(appts)})")
+                for a in appts[:10]:
+                    a_status = a.get("status", "—")
+                    s_cfg = {
+                        "booked": "📅", "checked_in": "✅", "in_progress": "🔄",
+                        "completed": "✔️", "no_show": "⚠️", "cancelled": "❌",
+                    }
+                    a_icon = s_cfg.get(a_status, "•")
+                    with st.container(border=True):
+                        ac1, ac2, ac3 = st.columns([2, 3, 2])
+                        ac1.write(f"{a_icon} {a_status.replace('_', ' ').title()}")
+                        ac2.write(f"📅 {a.get('session_date', '—')}  •  🩺 {a.get('doctor_name', '—')}")
+                        ac3.write(f"{a.get('specialization', '')}")
+
+            # ── Nurse actions ──
+            st.divider()
+            st.markdown("**⚙️ Actions**")
+            na1, na2 = st.columns(2)
+
+            # Book appointment (with beneficiary picker)
+            with na1.popover("📅 Book Appointment", use_container_width=True):
+                st.markdown("**Book Appointment**")
+                # Who is this for?
+                nbk_opts = [f"{name} (Self)"]
+                nbk_ids = {0: pid}
+                for ri, rel in enumerate(rels):
+                    bname = rel.get("beneficiary_name", "?")
+                    rtype = (rel.get("relationship_type") or "other").title()
+                    nbk_opts.append(f"{bname} ({rtype})")
+                    nbk_ids[ri + 1] = rel.get("beneficiary_patient_id", pid)
+                nbk_for = st.radio("Booking for", nbk_opts, key=f"nbk_for_{pid}")
+                nbk_sel = nbk_opts.index(nbk_for) if nbk_for in nbk_opts else 0
+                nbk_pid = nbk_ids.get(nbk_sel, pid)
+                nbk_name = nbk_for.split(" (")[0]
+
+                st.divider()
+                try:
+                    nbk_docs = api.list_doctors()
+                except Exception:
+                    nbk_docs = []
+                nbk_depts = sorted(set(d.get("specialization", "") for d in nbk_docs if d.get("specialization")))
+                nbk_dept = st.selectbox("Department", ["All"] + nbk_depts, key=f"nbk_dept_{pid}")
+                if nbk_dept != "All":
+                    nbk_docs = [d for d in nbk_docs if d.get("specialization") == nbk_dept]
+                if not nbk_docs:
+                    st.warning("No doctors available.")
+                else:
+                    nbk_doc_labels = [f"{d['full_name']} ({d['specialization']})" for d in nbk_docs]
+                    nbk_doc_idx = st.selectbox("Doctor", range(len(nbk_doc_labels)),
+                                                format_func=lambda i: nbk_doc_labels[i], key=f"nbk_doc_{pid}")
+                    nbk_doc = nbk_docs[nbk_doc_idx]
+                    try:
+                        nbk_sessions = api.get_doctor_sessions(nbk_doc["doctor_id"])
+                        nbk_active = [s for s in nbk_sessions if s["status"] == "active"]
+                    except Exception:
+                        nbk_active = []
+                    if not nbk_active:
+                        st.info("No active sessions.")
+                    else:
+                        nbk_sess_labels = [
+                            f"{s['session_date']} • {str(s.get('start_time', ''))[:5]}–{str(s.get('end_time', ''))[:5]} • {s.get('available_capacity', '?')} slots"
+                            for s in nbk_active
+                        ]
+                        nbk_sess_idx = st.selectbox("Session", range(len(nbk_sess_labels)),
+                                                     format_func=lambda i: nbk_sess_labels[i], key=f"nbk_sess_{pid}")
+                        nbk_sess = nbk_active[nbk_sess_idx]
+                        nbk_total = nbk_sess.get("total_slots", 1)
+                        nbk_dur = nbk_sess.get("slot_duration_minutes", 15)
+                        nbk_start = str(nbk_sess.get("start_time", "09:00"))
+                        nbk_slot_opts = []
+                        for si in range(1, nbk_total + 1):
+                            try:
+                                hh, mm = int(nbk_start[:2]), int(nbk_start[3:5])
+                                t_min = hh * 60 + mm + (si - 1) * nbk_dur
+                                t_str = f"{t_min // 60:02d}:{t_min % 60:02d}"
+                            except Exception:
+                                t_str = f"Slot {si}"
+                            nbk_slot_opts.append(f"Slot {si} — {t_str}")
+                        nbk_slot_idx = st.selectbox("Time Slot", range(len(nbk_slot_opts)),
+                                                     format_func=lambda i: nbk_slot_opts[i], key=f"nbk_slot_{pid}")
+                        nbk_slot_num = nbk_slot_idx + 1
+                        st.caption(f"**Patient:** {nbk_name}  •  **Doctor:** {nbk_doc['full_name']}  •  **Slot:** {nbk_slot_opts[nbk_slot_idx]}")
+                        if st.button("✅ Confirm Booking", key=f"nbk_confirm_{pid}", type="primary", use_container_width=True):
+                            try:
+                                api.staff_book({
+                                    "session_id": nbk_sess["session_id"],
+                                    "patient_id": nbk_pid,
+                                    "slot_number": nbk_slot_num,
+                                })
+                                st.session_state["nurse_pat_msg"] = f"Booked for {nbk_name} with {nbk_doc['full_name']}"
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"Booking failed: {ex}")
+
+            # Edit profile
+            with na2.popover("✏️ Update Info", use_container_width=True):
+                np_phone = st.text_input("Phone", value=detail.get("phone") or "", key=f"np_ph_{pid}")
+                np_blood = st.selectbox("Blood Group",
+                                         ["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"],
+                                         index=["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"].index(detail.get("blood_group") or ""),
+                                         key=f"np_bg_{pid}")
+                np_abha = st.text_input("ABHA/UHID", value=detail.get("abha_id") or "", key=f"np_abha_{pid}")
+                np_ec_name = st.text_input("Emergency Name", value=detail.get("emergency_contact_name") or "", key=f"np_ecn_{pid}")
+                np_ec_phone = st.text_input("Emergency Phone", value=detail.get("emergency_contact_phone") or "", key=f"np_ecp_{pid}")
+                np_addr = st.text_input("Address", value=detail.get("address") or "", key=f"np_addr_{pid}")
+                if st.button("Save", key=f"np_save_{pid}", type="primary", use_container_width=True):
+                    payload = {}
+                    if np_phone: payload["phone"] = np_phone
+                    if np_blood: payload["blood_group"] = np_blood
+                    if np_abha: payload["abha_id"] = np_abha
+                    if np_ec_name: payload["emergency_contact_name"] = np_ec_name
+                    if np_ec_phone: payload["emergency_contact_phone"] = np_ec_phone
+                    if np_addr: payload["address"] = np_addr
+                    if payload:
+                        try:
+                            api.admin_update_patient(pid, payload)
+                            st.session_state["nurse_pat_msg"] = f"Updated {name}"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"{e}")
+                    else:
+                        st.info("No changes.")
+
+
+# ════════════════════════════════════════════════════════════
 # ADMIN: CANCEL SESSION
 # ════════════════════════════════════════════════════════════
 
@@ -2862,7 +3624,10 @@ def page_nurse_emergency():
 
 def page_admin_dashboard():
     """Admin overview — today's stats at a glance."""
-    st.title("🏠 Admin Dashboard")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("🏠 Admin Dashboard")
+    if tc2.button("🔄 Refresh", key="refresh_admin_dash", use_container_width=True):
+        st.rerun()
     try:
         stats = api.admin_stats()
     except Exception as e:
@@ -2917,7 +3682,10 @@ def page_admin_dashboard():
 
 def page_admin_users():
     """User management — create, view, activate/deactivate staff."""
-    st.title("👥 User Management")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("👥 User Management")
+    if tc2.button("🔄 Refresh", key="refresh_admin_users", use_container_width=True):
+        st.rerun()
 
     # ── Persistent message ──
     if st.session_state.get("admin_msg"):
@@ -3042,7 +3810,10 @@ def page_admin_users():
 
 def page_admin_doctors():
     """Doctor management — view all, toggle availability, edit settings."""
-    st.title("🩺 Doctor Management")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("🩺 Doctor Management")
+    if tc2.button("🔄 Refresh", key="refresh_admin_docs", use_container_width=True):
+        st.rerun()
 
     if st.session_state.get("admin_msg"):
         st.success(st.session_state.pop("admin_msg"))
@@ -3139,7 +3910,10 @@ def page_admin_doctors():
 
 def page_admin_config():
     """System configuration — scheduling_config key-value store."""
-    st.title("⚙️ System Configuration")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("⚙️ System Configuration")
+    if tc2.button("🔄 Refresh", key="refresh_admin_config", use_container_width=True):
+        st.rerun()
 
     if st.session_state.get("admin_msg"):
         st.success(st.session_state.pop("admin_msg"))
@@ -3187,8 +3961,13 @@ def page_admin_config():
 
 
 def page_admin_patients():
-    """Patient management — search, view risk scores, reset risks."""
-    st.title("🏥 Patient Management")
+    """Patient management — search, view details, manage appointments, edit profiles, reset risks."""
+    from datetime import date as _d, datetime as _dt
+
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("🏥 Patient Management")
+    if tc2.button("🔄 Refresh", key="refresh_admin_pat", use_container_width=True):
+        st.rerun()
 
     if st.session_state.get("admin_msg"):
         st.success(st.session_state.pop("admin_msg"))
@@ -3200,9 +3979,9 @@ def page_admin_patients():
         all_docs = []
     departments = sorted(set(d.get("specialization", "") for d in all_docs if d.get("specialization")))
 
-    # Filters
-    fc1, fc2, fc3, fc4 = st.columns([3, 2, 2, 1])
-    search = fc1.text_input("🔍 Search", key="admin_pat_search", placeholder="Name or phone...")
+    # ── Filters ──
+    fc1, fc2, fc3, fc4, fc5 = st.columns([3, 2, 2, 1, 1])
+    search = fc1.text_input("🔍 Search", key="admin_pat_search", placeholder="Name, phone, or ABHA...")
     filter_dept = fc2.selectbox("Department", ["All"] + departments, key="admin_pat_dept")
     if filter_dept != "All":
         dept_docs = [d for d in all_docs if d.get("specialization") == filter_dept]
@@ -3211,8 +3990,8 @@ def page_admin_patients():
     doc_names = ["All"] + [d["full_name"] for d in dept_docs]
     filter_doc = fc3.selectbox("Doctor", doc_names, key="admin_pat_doc")
     high_risk = fc4.checkbox("High risk", key="admin_pat_hr")
+    show_inactive = fc5.checkbox("Deactivated", key="admin_pat_inactive")
 
-    # Resolve doctor_id
     sel_doc_id = ""
     if filter_doc != "All":
         match = [d for d in dept_docs if d["full_name"] == filter_doc]
@@ -3223,19 +4002,29 @@ def page_admin_patients():
         patients = api.admin_list_patients(
             search=search if search and len(search) >= 2 else "",
             high_risk_only=high_risk,
+            include_inactive=show_inactive,
             specialization="" if filter_dept == "All" else filter_dept,
             doctor_id=sel_doc_id,
         )
     except Exception as e:
-        st.error(f"Failed: {e}")
-        return
+        st.error(f"Failed: {e}"); return
 
     if not patients:
-        st.info("No patients found.")
-        return
+        st.info("No patients found."); return
 
-    st.caption(f"Showing {len(patients)} patients")
+    # ── Summary metrics ──
+    total = len(patients)
+    hr_count = sum(1 for p in patients if float(p.get("risk_score") or 0) >= 7)
+    total_visits = sum(int(p.get("total_appointments") or 0) for p in patients)
+    total_noshow = sum(int(p.get("no_shows") or 0) for p in patients)
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("Patients", total)
+    mc2.metric("High Risk", hr_count)
+    mc3.metric("Total Visits", total_visits)
+    mc4.metric("Total No-Shows", total_noshow)
+    st.divider()
 
+    # ── Patient list — click to expand full details ──
     for p in patients:
         pid = str(p["patient_id"])
         try:
@@ -3253,43 +4042,273 @@ def page_admin_patients():
             no_shows = 0
         ns_rate = f"{(no_shows / total_appt * 100):.0f}%" if total_appt > 0 else "—"
 
-        with st.container(border=True):
-            pc1, pc2, pc3 = st.columns([3, 2, 1])
-            age_str = ""
-            if p.get("date_of_birth") and p["date_of_birth"] != "None":
+        age_str = ""
+        if p.get("date_of_birth") and p["date_of_birth"] != "None":
+            try:
+                dob = _d.fromisoformat(str(p["date_of_birth"])[:10])
+                age_str = f"{(_d.today() - dob).days // 365}y"
+            except Exception:
+                pass
+        gender_str = (p.get("gender") or "—")[:1].upper() if p.get("gender") and p["gender"] != "None" else "—"
+        name = p.get("full_name", "—")
+        p_active = p.get("is_active") not in ("False", "false", False)
+        inactive_tag = "  •  🚫 DEACTIVATED" if not p_active else ""
+
+        header = (
+            f"{risk_dot} **{name}**{inactive_tag}  •  {age_str}/{gender_str}  "
+            f"•  📞 {p.get('phone') or '—'}  •  🩸 {p.get('blood_group') or '—'}  "
+            f"•  Visits: {total_appt}  •  No-shows: {no_shows} ({ns_rate})"
+        )
+
+        with st.expander(header, expanded=False):
+            # ── Load full patient detail on expand ──
+            try:
+                detail = api.admin_get_patient(pid)
+            except Exception as e:
+                st.error(f"Could not load details: {e}"); continue
+
+            # ── Profile info (two columns) ──
+            d1, d2 = st.columns(2)
+            with d1:
+                with st.container(border=True):
+                    st.markdown("**Personal Info**")
+                    st.write(f"**Name:** {detail.get('full_name', '—')}")
+                    st.write(f"**Email:** {detail.get('email', '—')}")
+                    st.write(f"**Phone:** {detail.get('phone') or '⚠️ Not set'}")
+                    st.write(f"**DOB:** {detail.get('date_of_birth', '—')}  •  **Age:** {age_str}")
+                    st.write(f"**Gender:** {(detail.get('gender') or '—').title()}")
+                    st.write(f"**Blood Group:** {detail.get('blood_group') or '⚠️ Not set'}")
+                    st.write(f"**ABHA/UHID:** {detail.get('abha_id') or '⚠️ Not set'}")
+
+            with d2:
+                with st.container(border=True):
+                    st.markdown("**Emergency & Risk**")
+                    st.write(f"**Emergency Contact:** {detail.get('emergency_contact_name') or '⚠️ Not set'}")
+                    st.write(f"**Emergency Phone:** {detail.get('emergency_contact_phone') or '⚠️ Not set'}")
+                    st.write(f"**Address:** {detail.get('address') or '⚠️ Not set'}")
+                    st.write(f"**Risk Score:** {risk_dot} {risk:.1f}")
+                    st.write(f"**Account Active:** {'✅ Yes' if detail.get('is_active') == 'True' else '❌ No'}")
+                    st.write(f"**Registered:** {str(detail.get('created_at', ''))[:10]}")
+
+            # ── Family members / Relationships ──
+            rels = detail.get("relationships", [])
+            if rels:
+                st.markdown("**👨‍👩‍👧‍👦 Family Members**")
+                for r in rels:
+                    rc1, rc2, rc3 = st.columns([3, 2, 1])
+                    rc1.write(f"**{r.get('beneficiary_name', '—')}**")
+                    rc2.write(f"Relation: {(r.get('relationship_type') or '—').title()}")
+                    rc3.write("✅ Linked" if r.get("is_approved") in (True, "True", "true") else "⏳ Pending")
+
+            # ── Appointment history ──
+            appts = detail.get("appointments", [])
+            st.markdown(f"**📋 Appointment History** ({len(appts)} recent)")
+            if appts:
+                for a in appts:
+                    a_status = a.get("status", "—")
+                    a_id = a.get("appointment_id", "")
+                    s_cfg = {
+                        "booked": ("📅", "#3b82f6"),
+                        "checked_in": ("✅", "#f59e0b"),
+                        "in_progress": ("🔄", "#8b5cf6"),
+                        "completed": ("✔️", "#22c55e"),
+                        "no_show": ("⚠️", "#ef4444"),
+                        "cancelled": ("❌", "#9ca3af"),
+                    }
+                    a_icon, a_color = s_cfg.get(a_status, ("•", "#666"))
+                    slot_t = str(a.get("start_time", ""))[:5]
+                    a_date = a.get("session_date", "—")
+                    doc_name = a.get("doctor_name", "—")
+                    spec = a.get("specialization", "")
+
+                    with st.container(border=True):
+                        ac1, ac2, ac3, ac4 = st.columns([2, 2, 2, 2])
+                        ac1.write(f"{a_icon} **{a_status.replace('_', ' ').title()}**")
+                        ac2.write(f"📅 {a_date}  •  🕐 {slot_t}")
+                        ac3.write(f"🩺 {doc_name} ({spec})")
+                        # Action buttons based on status
+                        if a_status == "booked":
+                            bc1, bc2 = ac4.columns(2)
+                            if bc1.button("✖ Cancel", key=f"adm_cx_{a_id}", use_container_width=True):
+                                try:
+                                    api.cancel_appointment({"appointment_id": a_id, "reason": "Cancelled by admin"})
+                                    st.session_state["admin_msg"] = f"Cancelled appointment for {name}"
+                                    st.rerun()
+                                except Exception as ex:
+                                    st.error(f"{ex}")
+                        elif a_status == "no_show":
+                            if ac4.button("↩ Undo", key=f"adm_uns_{a_id}", use_container_width=True):
+                                try:
+                                    api.undo_noshow({"appointment_id": a_id})
+                                    st.session_state["admin_msg"] = f"No-show undone for {name}"
+                                    st.rerun()
+                                except Exception as ex:
+                                    st.error(f"{ex}")
+                        elif a_status == "cancelled":
+                            if ac4.button("↩ Restore", key=f"adm_ucx_{a_id}", use_container_width=True):
+                                try:
+                                    api.undo_cancel({"appointment_id": a_id})
+                                    st.session_state["admin_msg"] = f"Appointment restored for {name}"
+                                    st.rerun()
+                                except Exception as ex:
+                                    st.error(f"{ex}")
+                        elif a_status in ("completed", "checked_in", "in_progress"):
+                            ac4.write(f"Slot #{a.get('slot_number', '—')}")
+                        if a.get("notes") and a["notes"] != "None":
+                            st.caption(f"📝 {a['notes']}")
+            else:
+                st.info("No appointments found for this patient.")
+
+            # ── Admin actions bar ──
+            st.divider()
+            st.markdown("**⚙️ Admin Actions**")
+            act1, act2, act3, act4 = st.columns(4)
+
+            # Book appointment for this patient (or their beneficiary)
+            with act1.popover("📅 Book Appointment", use_container_width=True):
+                st.markdown(f"**Book Appointment**")
+
+                # ── Who is this for? (self + beneficiaries) ──
+                bk_for_options = [f"{name} (Self)"]
+                bk_for_ids = {0: pid}  # index → patient_id to book for
+                bk_rels = detail.get("relationships", [])
+                for ri, rel in enumerate(bk_rels):
+                    bname = rel.get("beneficiary_name", "?")
+                    rtype = (rel.get("relationship_type") or "other").title()
+                    bk_for_options.append(f"{bname} ({rtype})")
+                    bk_for_ids[ri + 1] = rel.get("beneficiary_patient_id", pid)
+                bk_for_idx = st.radio("Booking for", bk_for_options, key=f"bk_for_{pid}", horizontal=False)
+                bk_for_sel = bk_for_options.index(bk_for_idx) if bk_for_idx in bk_for_options else 0
+                bk_patient_id = bk_for_ids.get(bk_for_sel, pid)
+                bk_patient_name = bk_for_idx.split(" (")[0]
+
+                st.divider()
+
+                # ── Department filter ──
                 try:
-                    from datetime import date as _d
-                    dob = _d.fromisoformat(str(p["date_of_birth"])[:10])
-                    age_str = f"{(_d.today() - dob).days // 365}y"
+                    bk_docs = api.list_doctors()
                 except Exception:
-                    pass
-            gender_str = (p.get("gender") or "—")[:1].upper() if p.get("gender") and p["gender"] != "None" else "—"
-            pc1.markdown(
-                f"**{p.get('full_name', '—')}**  •  {age_str}/{gender_str}  "
-                f"•  📞 {p.get('phone') or '—'}  •  🩸 {p.get('blood_group') or '—'}"
-            )
-            if p.get("abha_id") and p["abha_id"] != "None":
-                pc1.caption(f"ABHA: {p['abha_id']}")
+                    bk_docs = []
+                bk_depts = sorted(set(d.get("specialization", "") for d in bk_docs if d.get("specialization")))
+                bk_dept = st.selectbox("Department", ["All"] + bk_depts, key=f"bk_dept_{pid}")
+                if bk_dept != "All":
+                    bk_docs = [d for d in bk_docs if d.get("specialization") == bk_dept]
+                if not bk_docs:
+                    st.warning("No doctors available.")
+                else:
+                    bk_doc_labels = [f"{d['full_name']} ({d['specialization']})" for d in bk_docs]
+                    bk_doc_idx = st.selectbox("Doctor", range(len(bk_doc_labels)),
+                                               format_func=lambda i: bk_doc_labels[i], key=f"bk_doc_{pid}")
+                    bk_doc = bk_docs[bk_doc_idx]
+                    # Load sessions
+                    try:
+                        bk_sessions = api.get_doctor_sessions(bk_doc["doctor_id"])
+                        bk_active = [s for s in bk_sessions if s["status"] == "active"]
+                    except Exception:
+                        bk_active = []
+                    if not bk_active:
+                        st.info("No active sessions for this doctor.")
+                    else:
+                        bk_sess_labels = [
+                            f"{s['session_date']} • {str(s.get('start_time', ''))[:5]}–{str(s.get('end_time', ''))[:5]} • {s.get('available_capacity', '?')} slots"
+                            for s in bk_active
+                        ]
+                        bk_sess_idx = st.selectbox("Session", range(len(bk_sess_labels)),
+                                                    format_func=lambda i: bk_sess_labels[i], key=f"bk_sess_{pid}")
+                        bk_sess = bk_active[bk_sess_idx]
+                        bk_total = bk_sess.get("total_slots", 1)
+                        bk_dur = bk_sess.get("slot_duration_minutes", 15)
+                        bk_start = str(bk_sess.get("start_time", "09:00"))
+                        # Slot picker
+                        bk_slot_opts = []
+                        for si in range(1, bk_total + 1):
+                            try:
+                                hh, mm = int(bk_start[:2]), int(bk_start[3:5])
+                                t_min = hh * 60 + mm + (si - 1) * bk_dur
+                                t_str = f"{t_min // 60:02d}:{t_min % 60:02d}"
+                            except Exception:
+                                t_str = f"Slot {si}"
+                            bk_slot_opts.append(f"Slot {si} — {t_str}")
+                        bk_slot_idx = st.selectbox("Time Slot", range(len(bk_slot_opts)),
+                                                    format_func=lambda i: bk_slot_opts[i], key=f"bk_slot_{pid}")
+                        bk_slot_num = bk_slot_idx + 1
 
-            pc2.write(f"{risk_dot} Risk: **{risk:.1f}**  •  Visits: **{total_appt}**  •  No-shows: **{no_shows}** ({ns_rate})")
+                        # Summary
+                        st.caption(f"**Patient:** {bk_patient_name}  •  **Doctor:** {bk_doc['full_name']}  •  **Slot:** {bk_slot_opts[bk_slot_idx]}")
 
-            if risk > 0:
-                with pc3.popover("Reset Risk"):
-                    new_risk = st.number_input("New score", 0.0, 10.0, 0.0,
-                                               step=0.5, key=f"rr_{pid}")
-                    if st.button("Reset", key=f"rr_btn_{pid}", type="primary",
-                                 use_container_width=True):
+                        if st.button("✅ Confirm Booking", key=f"bk_confirm_{pid}", type="primary", use_container_width=True):
+                            try:
+                                result = api.staff_book({
+                                    "session_id": bk_sess["session_id"],
+                                    "patient_id": bk_patient_id,
+                                    "slot_number": bk_slot_num,
+                                })
+                                st.session_state["admin_msg"] = f"Appointment booked for {bk_patient_name} with {bk_doc['full_name']}"
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"Booking failed: {ex}")
+
+            # Risk reset
+            with act2.popover("🔧 Reset Risk", use_container_width=True):
+                new_risk = st.number_input("New score", 0.0, 10.0, 0.0, step=0.5, key=f"rr_{pid}")
+                if st.button("Reset Risk", key=f"rr_btn_{pid}", type="primary", use_container_width=True):
+                    try:
+                        api.admin_reset_risk(pid, new_risk)
+                        st.session_state["admin_msg"] = f"Risk reset to {new_risk} for {name}"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"{e}")
+
+            # Edit profile
+            with act3.popover("✏️ Edit Profile", use_container_width=True):
+                ep_phone = st.text_input("Phone", value=detail.get("phone") or "", key=f"ep_ph_{pid}")
+                ep_blood = st.selectbox("Blood Group",
+                                         ["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"],
+                                         index=["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"].index(detail.get("blood_group") or ""),
+                                         key=f"ep_bg_{pid}")
+                ep_abha = st.text_input("ABHA/UHID", value=detail.get("abha_id") or "", key=f"ep_abha_{pid}")
+                ep_addr = st.text_input("Address", value=detail.get("address") or "", key=f"ep_addr_{pid}")
+                ep_ec_name = st.text_input("Emergency Name", value=detail.get("emergency_contact_name") or "", key=f"ep_ecn_{pid}")
+                ep_ec_phone = st.text_input("Emergency Phone", value=detail.get("emergency_contact_phone") or "", key=f"ep_ecp_{pid}")
+                if st.button("Save Changes", key=f"ep_save_{pid}", type="primary", use_container_width=True):
+                    payload = {}
+                    if ep_phone: payload["phone"] = ep_phone
+                    if ep_blood: payload["blood_group"] = ep_blood
+                    if ep_abha: payload["abha_id"] = ep_abha
+                    if ep_addr: payload["address"] = ep_addr
+                    if ep_ec_name: payload["emergency_contact_name"] = ep_ec_name
+                    if ep_ec_phone: payload["emergency_contact_phone"] = ep_ec_phone
+                    if payload:
                         try:
-                            api.admin_reset_risk(pid, new_risk)
-                            st.session_state["admin_msg"] = f"Risk reset for {p['full_name']}"
+                            api.admin_update_patient(pid, payload)
+                            st.session_state["admin_msg"] = f"Profile updated for {name}"
                             st.rerun()
                         except Exception as e:
                             st.error(f"{e}")
+                    else:
+                        st.info("No changes to save.")
+
+            # Toggle active status
+            is_active = detail.get("is_active") in ("True", "true", True)
+            toggle_label = "🚫 Deactivate" if is_active else "✅ Reactivate"
+            if act4.button(toggle_label, key=f"toggle_{pid}", use_container_width=True):
+                try:
+                    uid = detail.get("user_id", "")
+                    if uid and uid != "None":
+                        api.admin_toggle_user(uid)
+                        status_word = "deactivated" if is_active else "reactivated"
+                        st.session_state["admin_msg"] = f"Account {status_word} for {name}"
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"{e}")
 
 
 def page_admin_sessions():
     """Session overview — all sessions across all doctors, with department & doctor filters."""
-    st.title("📅 Session Overview")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("📅 Session Overview")
+    if tc2.button("🔄 Refresh", key="refresh_admin_sess", use_container_width=True):
+        st.rerun()
 
     # Load doctors for filter dropdowns
     try:
@@ -3380,7 +4399,10 @@ def page_admin_sessions():
 
 def page_admin_audit():
     """Audit log viewer — all system actions."""
-    st.title("📜 Audit Logs")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("📜 Audit Logs")
+    if tc2.button("🔄 Refresh", key="refresh_admin_audit", use_container_width=True):
+        st.rerun()
 
     # Filters
     fc1, fc2, fc3 = st.columns(3)
@@ -3440,7 +4462,10 @@ def page_admin_audit():
 
 
 def page_admin_cancel():
-    st.title("❌ Cancel Entire Session")
+    tc1, tc2 = st.columns([6, 1])
+    tc1.title("❌ Cancel Entire Session")
+    if tc2.button("🔄 Refresh", key="refresh_admin_cancel", use_container_width=True):
+        st.rerun()
     st.error("This cancels ALL appointments. No penalties applied to patients.")
 
     session_id = _smart_session_picker("cancel_sp")
@@ -3733,19 +4758,74 @@ def _show_admin_intake_form():
         st.rerun()
 
 
+def _autoplay_audio(audio_bytes: bytes):
+    """Inject an auto-playing HTML audio element for TTS output."""
+    b64 = base64.b64encode(audio_bytes).decode()
+    st.markdown(
+        f'<audio autoplay src="data:audio/mpeg;base64,{b64}"></audio>',
+        unsafe_allow_html=True,
+    )
+
+
+def _send_and_reply(prompt: str, speak: bool = False):
+    """Send a message to the chatbot, display the reply, and optionally speak it."""
+    st.session_state.chat_messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                # Only send patient_context on the FIRST message (server stores it)
+                ctx = ""
+                if not st.session_state.get("chat_context_sent"):
+                    ctx = st.session_state.chat_patient_context
+                    st.session_state.chat_context_sent = True
+
+                response = api.chat_send_message(
+                    message=prompt,
+                    patient_context=ctx,
+                )
+                reply = response.get("reply", "Sorry, I couldn't process that.")
+            except Exception as e:
+                reply = f"Error communicating with AI: {e}"
+
+            st.markdown(reply)
+            st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+
+        # Text-to-Speech: convert reply to audio and auto-play
+        if speak and reply and not reply.startswith("Error"):
+            try:
+                with st.spinner("Speaking..."):
+                    tts_audio = api.chat_tts(reply)
+                    _autoplay_audio(tts_audio)
+            except Exception:
+                pass  # TTS failure is non-critical, text reply is still shown
+
+
 def _show_chat_interface():
-    """Chat interface — shown after the intake form is filled or in direct-chat mode."""
+    """Chat interface with text input, mic button, and TTS auto-play."""
     user = st.session_state.user
     role = user["role"]
 
+    # Init voice mode toggle
+    if "voice_mode" not in st.session_state:
+        st.session_state.voice_mode = False
+
     # Toolbar
-    col1, col2, col3 = st.columns([6, 2, 2])
+    col1, col2, col3, col4 = st.columns([5, 1.5, 1.5, 2])
     with col1:
         mode_label = "Booking" if st.session_state.chat_mode == "book" else "Chat"
         st.caption(f"Chatting as **{user['full_name']}** ({role.upper()}) — {mode_label} mode")
     with col2:
+        # Voice mode toggle
+        if HAS_AUDIO_RECORDER:
+            voice_label = "🔊 Voice On" if st.session_state.voice_mode else "🔇 Voice Off"
+            if st.button(voice_label, use_container_width=True, key="toggle_voice"):
+                st.session_state.voice_mode = not st.session_state.voice_mode
+                st.rerun()
+    with col3:
         if st.button("🔄 New Chat", use_container_width=True):
-            # Clear server-side conversation memory
             try:
                 api.chat_clear()
             except Exception:
@@ -3755,8 +4835,9 @@ def _show_chat_interface():
             st.session_state.chat_patient_context = ""
             st.session_state.chat_mode = ""
             st.session_state.chat_context_sent = False
+            st.session_state.voice_mode = False
             st.rerun()
-    with col3:
+    with col4:
         if st.session_state.chat_mode == "book" and role in ("nurse", "admin"):
             if st.button("📋 Edit Form", use_container_width=True):
                 st.session_state.chat_form_done = False
@@ -3769,31 +4850,38 @@ def _show_chat_interface():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Chat input
+    # ── Mic input (voice mode) ──
+    if HAS_AUDIO_RECORDER and st.session_state.voice_mode:
+        st.markdown("**🎙️ Tap the mic to speak, tap again to stop:**")
+        audio_bytes = audio_recorder(
+            text="",
+            recording_color="#e74c3c",
+            neutral_color="#3498db",
+            icon_size="2x",
+            pause_threshold=2.0,
+            key="voice_recorder",
+        )
+        if audio_bytes:
+            # Avoid re-processing the same audio on Streamlit reruns
+            audio_hash = hash(audio_bytes)
+            if audio_hash != st.session_state.get("_last_audio_hash"):
+                st.session_state._last_audio_hash = audio_hash
+                with st.spinner("Transcribing your speech..."):
+                    try:
+                        result = api.chat_transcribe(audio_bytes, filename="voice.wav")
+                        transcribed_text = result.get("text", "").strip()
+                    except Exception as e:
+                        st.error(f"Could not transcribe audio: {e}")
+                        transcribed_text = ""
+
+                if transcribed_text:
+                    _send_and_reply(transcribed_text, speak=True)
+                    st.rerun()
+
+    # ── Text input (always available) ──
     if prompt := st.chat_input("Type your message..."):
-        st.session_state.chat_messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    # Only send patient_context on the FIRST message (server stores it)
-                    ctx = ""
-                    if not st.session_state.get("chat_context_sent"):
-                        ctx = st.session_state.chat_patient_context
-                        st.session_state.chat_context_sent = True
-
-                    response = api.chat_send_message(
-                        message=prompt,
-                        patient_context=ctx,
-                    )
-                    reply = response.get("reply", "Sorry, I couldn't process that.")
-                except Exception as e:
-                    reply = f"Error communicating with AI: {e}"
-
-                st.markdown(reply)
-                st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+        _send_and_reply(prompt, speak=st.session_state.voice_mode)
+        st.rerun()
 
 
 # ════════════════════════════════════════════════════════════
@@ -3822,6 +4910,7 @@ PAGE_MAP = {
     "doctor_session": page_doctor_session,
     "staff_session": page_staff_session,
     "nurse_emergency": page_nurse_emergency,
+    "nurse_patients": page_nurse_patients,
     "admin_home": page_admin_dashboard,
     "admin_users": page_admin_users,
     "admin_doctors": page_admin_doctors,
@@ -3834,13 +4923,45 @@ PAGE_MAP = {
 }
 
 
+def _handle_google_callback():
+    """Check URL query params for Google OAuth callback tokens or errors."""
+    params = st.query_params
+
+    # Handle Google login error (user not registered)
+    if params.get("google_login_error"):
+        st.session_state["_google_error"] = params["google_login_error"]
+        st.query_params.clear()
+        return
+
+    # Handle successful Google login
+    if params.get("google_login") == "1" and params.get("access_token"):
+        st.session_state.access_token = params["access_token"]
+        st.session_state.refresh_token = params.get("refresh_token")
+        try:
+            me = api.get_me()
+            st.session_state.user = me["user"]
+            st.session_state.patient = me.get("patient")
+            st.session_state.page = "dashboard"
+        except Exception:
+            st.session_state.access_token = None
+            st.session_state.refresh_token = None
+        st.query_params.clear()
+
+
 def main():
+    _handle_google_callback()
     if not st.session_state.access_token:
         show_login()
         return
     show_sidebar()
     page_fn = PAGE_MAP.get(st.session_state.get("page", "dashboard"), page_dashboard)
-    page_fn()
+    try:
+        page_fn()
+    except Exception:
+        # If _auto_logout cleared the session (token expired), rerun to show login
+        if not st.session_state.access_token:
+            st.rerun()
+        raise  # Re-raise other errors normally
 
 
 if __name__ == "__main__":

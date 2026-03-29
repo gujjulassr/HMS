@@ -21,6 +21,7 @@ from lo.models.appointment import Appointment, AppointmentModel
 from lo.models.booking_audit_log import AuditModel
 from lo.models.notification_log import NotificationModel
 from go.services.booking_service import book_appointment, cancel_appointment
+from go.services.notification_dispatcher import notify_booking, notify_cancellation
 from api.schemas.appointment_schemas import (
     BookAppointmentRequest,
     EmergencyBookRequest,
@@ -117,6 +118,8 @@ async def book_route(
         appt_response = None
         if result["appointment"]:
             appt_response = await _enrich_appointment(db, result["appointment"])
+            # Send booking confirmation email (fire-and-forget)
+            notify_booking(db, result["appointment"].id)
 
         return BookingResultResponse(
             status=result["status"],
@@ -153,6 +156,9 @@ async def cancel_route(
             cancelled_by_user_id=user.id,
             reason=body.reason,
         )
+
+        # Send cancellation email (fire-and-forget)
+        notify_cancellation(db, UUID(body.appointment_id), reason=body.reason or "")
 
         return CancelResultResponse(
             status=result["status"],
@@ -753,6 +759,9 @@ async def staff_book(
 
     pat_user = await UserModel.get_by_id(db, patient.user_id)
     pat_name = pat_user.full_name if pat_user else "Patient"
+
+    # Send booking confirmation email (fire-and-forget)
+    notify_booking(db, appointment.id)
 
     return {
         "status": "booked",

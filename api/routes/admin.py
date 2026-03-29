@@ -500,15 +500,16 @@ async def get_audit_logs(
 async def list_patients(
     search: Optional[str] = Query(None, description="Search by name or phone"),
     high_risk_only: bool = Query(False),
+    include_inactive: bool = Query(False, description="Include deactivated patients"),
     specialization: Optional[str] = Query(None, description="Filter by department"),
     doctor_id: Optional[str] = Query(None, description="Filter by doctor"),
     limit: int = Query(50, le=200),
     offset: int = Query(0),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "nurse")),
     db: AsyncSession = Depends(get_db),
 ):
-    """List patients with full details, filterable by department/doctor."""
-    conditions = ["u.is_active = true"]
+    """List patients with full details, filterable by department/doctor. Accessible by admin and nurse."""
+    conditions = [] if include_inactive else ["u.is_active = true"]
     params = {"limit": limit, "offset": offset}
     joins = ""
 
@@ -538,7 +539,7 @@ async def list_patients(
             SELECT {distinct} p.id AS patient_id, p.user_id, p.abha_id, p.date_of_birth,
                    p.gender, p.blood_group, p.risk_score, p.address,
                    p.emergency_contact_name, p.emergency_contact_phone,
-                   u.full_name, u.email, u.phone, u.created_at,
+                   u.full_name, u.email, u.phone, u.is_active, u.created_at,
                    (SELECT COUNT(*) FROM appointments a WHERE a.patient_id = p.id) AS total_appointments,
                    (SELECT COUNT(*) FROM appointments a WHERE a.patient_id = p.id AND a.status = 'no_show') AS no_shows
             FROM patients p
@@ -569,6 +570,107 @@ async def reset_patient_risk(
         raise HTTPException(404, "Patient not found")
     await db.commit()
     return {"message": f"Risk score reset to {body.new_score}", "patient_id": patient_id}
+
+
+@router.get("/patients/{patient_id}")
+async def get_patient_detail(
+    patient_id: str,
+    user: User = Depends(require_role("admin", "nurse")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get full patient details including profile, relationships, and appointments. Accessible by admin and nurse."""
+    pid = UUID(patient_id)
+
+    # Patient + user profile
+    profile = await db.execute(
+        text("""
+            SELECT p.id AS patient_id, p.abha_id, p.date_of_birth, p.gender,
+                   p.blood_group, p.risk_score, p.address,
+                   p.emergency_contact_name, p.emergency_contact_phone,
+                   u.full_name, u.email, u.phone, u.is_active, u.created_at
+            FROM patients p JOIN users u ON p.user_id = u.id
+            WHERE p.id = :pid
+        """),
+        {"pid": pid},
+    )
+    row = profile.mappings().first()
+    if not row:
+        raise HTTPException(404, "Patient not found")
+    patient_data = {k: str(v) if v is not None else None for k, v in row.items()}
+
+    # Appointments (recent 20)
+    appts = await db.execute(
+        text("""
+            SELECT a.id AS appointment_id, a.status, a.slot_number,
+                   a.checked_in_at, a.completed_at, a.notes,
+                   s.session_date, s.start_time, s.end_time,
+                   u_d.full_name AS doctor_name, d.specialization
+            FROM appointments a
+            JOIN sessions s ON a.session_id = s.id
+            JOIN doctors d ON s.doctor_id = d.id
+            JOIN users u_d ON d.user_id = u_d.id
+            WHERE a.patient_id = :pid
+            ORDER BY s.session_date DESC, s.start_time DESC
+            LIMIT 20
+        """),
+        {"pid": pid},
+    )
+    appt_list = [{k: str(v) if v is not None else None for k, v in r.items()} for r in appts.mappings().all()]
+
+    # Family relationships
+    rels = await db.execute(
+        text("""
+            SELECT pr.relationship_type, pr.is_approved,
+                   u_b.full_name AS beneficiary_name, p_b.id AS beneficiary_patient_id
+            FROM patient_relationships pr
+            JOIN patients p_b ON pr.beneficiary_patient_id = p_b.id
+            JOIN users u_b ON p_b.user_id = u_b.id
+            WHERE pr.booker_patient_id = :pid AND pr.relationship_type != 'self'
+        """),
+        {"pid": pid},
+    )
+    rel_list = [{k: str(v) if v is not None else None for k, v in r.items()} for r in rels.mappings().all()]
+
+    return {**patient_data, "appointments": appt_list, "relationships": rel_list}
+
+
+@router.put("/patients/{patient_id}/update")
+async def admin_update_patient(
+    patient_id: str,
+    body: dict,
+    user: User = Depends(require_role("admin", "nurse")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin/nurse can update patient profile fields."""
+    pid = UUID(patient_id)
+    allowed = {
+        "phone", "blood_group", "abha_id", "address",
+        "emergency_contact_name", "emergency_contact_phone", "gender",
+    }
+    updates = {k: v for k, v in body.items() if k in allowed and v is not None}
+    if not updates:
+        raise HTTPException(400, "No valid fields to update")
+
+    # Split user vs patient fields
+    user_fields = {"phone"}
+    patient_fields = allowed - user_fields
+
+    if any(k in user_fields for k in updates):
+        user_sets = ", ".join(f"{k} = :{k}" for k in updates if k in user_fields)
+        if user_sets:
+            await db.execute(
+                text(f"UPDATE users SET {user_sets} WHERE id = (SELECT user_id FROM patients WHERE id = :pid)"),
+                {**{k: updates[k] for k in updates if k in user_fields}, "pid": pid},
+            )
+    if any(k in patient_fields for k in updates):
+        patient_sets = ", ".join(f"{k} = :{k}" for k in updates if k in patient_fields)
+        if patient_sets:
+            await db.execute(
+                text(f"UPDATE patients SET {patient_sets}, updated_at = NOW() WHERE id = :pid"),
+                {**{k: updates[k] for k in updates if k in patient_fields}, "pid": pid},
+            )
+    await db.commit()
+    return {"message": "Patient updated", "patient_id": patient_id}
 
 
 # ═══════════════════════════════════════════════════════════

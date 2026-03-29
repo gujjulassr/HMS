@@ -28,6 +28,12 @@ class Patient:
     updated_at: datetime
 
 
+def _row_to_patient(row) -> Patient:
+    """Safely convert a RowMapping to a Patient dataclass."""
+    d = dict(row)
+    return Patient(**d)
+
+
 class PatientModel:
 
     @staticmethod
@@ -64,7 +70,7 @@ class PatientModel:
             },
         )
         row = result.mappings().one()
-        return Patient(**row)
+        return _row_to_patient(row)
 
     @staticmethod
     async def get_by_id(db: AsyncSession, patient_id: UUID) -> Optional[Patient]:
@@ -73,7 +79,7 @@ class PatientModel:
             {"id": patient_id},
         )
         row = result.mappings().first()
-        return Patient(**row) if row else None
+        return _row_to_patient(row) if row else None
 
     @staticmethod
     async def get_by_user_id(db: AsyncSession, user_id: UUID) -> Optional[Patient]:
@@ -82,7 +88,7 @@ class PatientModel:
             {"user_id": user_id},
         )
         row = result.mappings().first()
-        return Patient(**row) if row else None
+        return _row_to_patient(row) if row else None
 
     @staticmethod
     async def get_by_abha_id(db: AsyncSession, abha_id: str) -> Optional[Patient]:
@@ -91,7 +97,7 @@ class PatientModel:
             {"abha_id": abha_id},
         )
         row = result.mappings().first()
-        return Patient(**row) if row else None
+        return _row_to_patient(row) if row else None
 
     @staticmethod
     async def update_risk_score(
@@ -108,7 +114,7 @@ class PatientModel:
             {"id": patient_id, "delta": delta},
         )
         row = result.mappings().first()
-        return Patient(**row) if row else None
+        return _row_to_patient(row) if row else None
 
     @staticmethod
     async def decay_all_risk_scores(db: AsyncSession, decay_amount: Decimal) -> int:
@@ -137,4 +143,4 @@ class PatientModel:
             fields,
         )
         row = result.mappings().first()
-        return Patient(**row) if row else None
+        return _row_to_patient(row) if row else None

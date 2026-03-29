@@ -19,6 +19,7 @@ from go.models.patient_relationship import PatientRelationship, RelationshipMode
 from api.schemas.patient_schemas import (
     UpdatePatientRequest,
     AddRelationshipRequest,
+    UpdateFamilyMemberRequest,
     PatientProfileResponse,
     RelationshipResponse,
 )
@@ -57,17 +58,32 @@ def _build_profile_response(user: User, patient: Patient) -> PatientProfileRespo
 
 
 def _build_relationship_response(
-    rel: PatientRelationship, beneficiary_name: str | None = None
+    rel: PatientRelationship,
+    ben_user: User | None = None,
+    ben_patient: Patient | None = None,
 ) -> RelationshipResponse:
-    return RelationshipResponse(
+    resp = RelationshipResponse(
         relationship_id=str(rel.id),
         booker_patient_id=str(rel.booker_patient_id),
         beneficiary_patient_id=str(rel.beneficiary_patient_id),
         relationship_type=rel.relationship_type,
-        beneficiary_name=beneficiary_name,
+        beneficiary_name=ben_user.full_name if ben_user else None,
         is_approved=rel.is_approved,
         created_at=rel.created_at,
     )
+    if ben_user:
+        resp.beneficiary_email = ben_user.email
+        resp.beneficiary_phone = ben_user.phone
+    if ben_patient:
+        resp.beneficiary_gender = ben_patient.gender
+        resp.beneficiary_date_of_birth = ben_patient.date_of_birth
+        resp.beneficiary_age = _calculate_age(ben_patient.date_of_birth)
+        resp.beneficiary_blood_group = ben_patient.blood_group
+        resp.beneficiary_abha_id = ben_patient.abha_id
+        resp.beneficiary_address = ben_patient.address
+        resp.beneficiary_emergency_contact_name = ben_patient.emergency_contact_name
+        resp.beneficiary_emergency_contact_phone = ben_patient.emergency_contact_phone
+    return resp
 
 
 # ─── GET /me — my patient profile ────────────────────────────
@@ -91,30 +107,53 @@ async def update_my_profile(
     db: AsyncSession = Depends(get_db),
 ):
     """Update editable fields on the patient's profile."""
-    # Collect only the fields that were actually sent (not None)
     patient_updates = {}
     user_updates = {}
 
+    # Only include fields that actually changed (skip unchanged values)
     if body.phone is not None:
-        user_updates["phone"] = body.phone
+        val = body.phone.strip() or None
+        if val != user.phone:
+            user_updates["phone"] = val
     if body.abha_id is not None:
-        patient_updates["abha_id"] = body.abha_id
+        val = body.abha_id.strip() or None
+        if val != patient.abha_id:
+            patient_updates["abha_id"] = val
     if body.blood_group is not None:
-        patient_updates["blood_group"] = body.blood_group
+        if body.blood_group != patient.blood_group:
+            patient_updates["blood_group"] = body.blood_group
     if body.emergency_contact_name is not None:
-        patient_updates["emergency_contact_name"] = body.emergency_contact_name
+        val = body.emergency_contact_name.strip() or None
+        if val != patient.emergency_contact_name:
+            patient_updates["emergency_contact_name"] = val
     if body.emergency_contact_phone is not None:
-        patient_updates["emergency_contact_phone"] = body.emergency_contact_phone
+        val = body.emergency_contact_phone.strip() or None
+        if val != patient.emergency_contact_phone:
+            patient_updates["emergency_contact_phone"] = val
     if body.address is not None:
-        patient_updates["address"] = body.address
+        val = body.address.strip() or None
+        if val != patient.address:
+            patient_updates["address"] = val
 
-    # Apply updates
-    if user_updates:
-        user = await UserModel.update(db, user.id, **user_updates)
-    if patient_updates:
-        patient = await PatientModel.update(db, patient.id, **patient_updates)
+    try:
+        if user_updates:
+            user = await UserModel.update(db, user.id, **user_updates)
+        if patient_updates:
+            patient = await PatientModel.update(db, patient.id, **patient_updates)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        msg = str(e).lower()
+        if "unique" in msg:
+            if "abha_id" in msg:
+                raise HTTPException(400, "This ABHA ID / UHID is already in use by another patient.")
+            if "phone" in msg:
+                raise HTTPException(400, "This phone number is already in use by another account.")
+            if "email" in msg:
+                raise HTTPException(400, "This email is already in use by another account.")
+            raise HTTPException(400, "A value you entered is already in use by another account.")
+        raise HTTPException(500, f"Profile update failed: {e}")
 
-    await db.commit()
     return _build_profile_response(user, patient)
 
 
@@ -130,14 +169,11 @@ async def get_my_relationships(
 
     results = []
     for rel in relationships:
-        # Look up the beneficiary's name
-        beneficiary = await PatientModel.get_by_id(db, rel.beneficiary_patient_id)
-        if beneficiary:
-            ben_user = await UserModel.get_by_id(db, beneficiary.user_id)
-            name = ben_user.full_name if ben_user else None
-        else:
-            name = None
-        results.append(_build_relationship_response(rel, name))
+        ben_patient = await PatientModel.get_by_id(db, rel.beneficiary_patient_id)
+        ben_user = None
+        if ben_patient:
+            ben_user = await UserModel.get_by_id(db, ben_patient.user_id)
+        results.append(_build_relationship_response(rel, ben_user, ben_patient))
 
     return results
 
@@ -189,11 +225,235 @@ async def add_relationship(
     )
     await db.commit()
 
-    # Get beneficiary name for response
+    # Get beneficiary details for response
     ben_user = await UserModel.get_by_id(db, beneficiary.user_id)
-    name = ben_user.full_name if ben_user else None
 
-    return _build_relationship_response(rel, name)
+    return _build_relationship_response(rel, ben_user, beneficiary)
+
+
+# ─── GET /me/find-beneficiary — patient searches by ABHA/UHID to link family ──
+
+@router.get("/me/find-beneficiary")
+async def find_beneficiary(
+    abha_id: str = Query(..., min_length=2, description="Search by ABHA ID or UHID"),
+    patient: Patient = Depends(get_current_patient),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Patient-facing: find another patient by ABHA/UHID to add as family member.
+    Returns limited info (name, age, gender) — no sensitive fields exposed.
+    """
+    result = await db.execute(
+        sql_text("""
+            SELECT u.full_name, p.id as patient_id, p.date_of_birth, p.gender,
+                   p.abha_id
+            FROM patients p
+            JOIN users u ON u.id = p.user_id
+            WHERE p.abha_id = :abha
+              AND p.id != :self_id
+            LIMIT 5
+        """),
+        {"abha": abha_id.strip(), "self_id": patient.id},
+    )
+    rows = result.mappings().all()
+    matches = []
+    for row in rows:
+        age = None
+        if row["date_of_birth"]:
+            today = date.today()
+            dob = row["date_of_birth"]
+            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+        matches.append({
+            "patient_id": str(row["patient_id"]),
+            "full_name": row["full_name"],
+            "age": age,
+            "gender": row["gender"],
+            "abha_id": row["abha_id"],
+        })
+    return matches
+
+
+# ─── POST /me/add-family — register a new family member + link relationship ──
+
+@router.post("/me/add-family", status_code=status.HTTP_201_CREATED)
+async def add_family_member(
+    body: dict,
+    user: User = Depends(get_current_user),
+    patient: Patient = Depends(get_current_patient),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Patient-facing: register a new family member who isn't in the system yet,
+    and link them as a beneficiary in one step.
+    Creates: user → patient → self-relationship → booker-relationship.
+    """
+    import uuid as _uuid
+
+    # Gate: booker must have their own UHID/ABHA set before linking family
+    if not patient.abha_id:
+        raise HTTPException(
+            400,
+            "You must set your own UHID (ABHA ID) in your profile before adding family members.",
+        )
+
+    full_name = (body.get("full_name") or "").strip()
+    if not full_name or len(full_name) < 2:
+        raise HTTPException(400, "Full name is required (min 2 chars)")
+
+    relationship_type = body.get("relationship_type", "other")
+    if relationship_type not in ("spouse", "parent", "child", "sibling", "guardian", "other"):
+        raise HTTPException(400, "Invalid relationship type")
+
+    # Parse optional fields
+    phone = (body.get("phone") or "").strip() or None
+    gender = body.get("gender") or "other"
+    dob_str = body.get("date_of_birth") or ""
+    try:
+        dob = date.fromisoformat(dob_str) if dob_str else date(2000, 1, 1)
+    except Exception:
+        dob = date(2000, 1, 1)
+
+    blood_group = (body.get("blood_group") or "").strip() or None
+
+    # Placeholder email — family member won't login
+    placeholder_email = f"family_{_uuid.uuid4().hex[:8]}@dpms.local"
+
+    # 1. Create user record
+    new_user = await UserModel.create(
+        db, email=placeholder_email, full_name=full_name,
+        role="patient", password_hash="FAMILY_NO_LOGIN", phone=phone,
+    )
+
+    # 2. Create patient record
+    new_patient = await PatientModel.create(
+        db, user_id=new_user.id, date_of_birth=dob,
+        gender=gender, blood_group=blood_group,
+    )
+
+    # 3. Self-relationship for the new patient
+    try:
+        await RelationshipModel.create(
+            db, booker_patient_id=new_patient.id,
+            beneficiary_patient_id=new_patient.id,
+            relationship_type="self",
+        )
+    except Exception:
+        pass  # non-critical
+
+    # 4. Link booker → new family member (auto-approved)
+    rel = await RelationshipModel.create(
+        db, booker_patient_id=patient.id,
+        beneficiary_patient_id=new_patient.id,
+        relationship_type=relationship_type,
+    )
+    # Auto-approve since the booker is creating the record
+    await db.execute(
+        sql_text("UPDATE patient_relationships SET is_approved = true, approved_at = NOW() WHERE id = :id"),
+        {"id": rel.id},
+    )
+    await db.commit()
+
+    return {
+        "status": "created",
+        "message": f"{full_name} added as {relationship_type} and linked to your account.",
+        "patient_id": str(new_patient.id),
+        "beneficiary_name": full_name,
+        "relationship_type": relationship_type,
+    }
+
+
+# ─── PUT /me/relationships/{id}/beneficiary — edit family member details ───
+
+@router.put(
+    "/me/relationships/{relationship_id}/beneficiary",
+    response_model=RelationshipResponse,
+)
+async def update_family_member_details(
+    relationship_id: str,
+    body: UpdateFamilyMemberRequest,
+    patient: Patient = Depends(get_current_patient),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a family member's profile details (name, phone, blood group, etc)."""
+    rel_id = UUID(relationship_id)
+
+    # Verify this relationship belongs to the current patient
+    result = await db.execute(
+        sql_text(
+            "SELECT * FROM patient_relationships WHERE id = :id AND booker_patient_id = :pid"
+        ),
+        {"id": rel_id, "pid": patient.id},
+    )
+    rel_row = result.mappings().first()
+    if not rel_row:
+        raise HTTPException(404, "Relationship not found or you don't have access.")
+
+    ben_patient_id = rel_row["beneficiary_patient_id"]
+    ben_patient = await PatientModel.get_by_id(db, ben_patient_id)
+    if not ben_patient:
+        raise HTTPException(404, "Beneficiary patient record not found.")
+    ben_user = await UserModel.get_by_id(db, ben_patient.user_id)
+    if not ben_user:
+        raise HTTPException(404, "Beneficiary user record not found.")
+
+    # Build updates for patient and user tables
+    patient_updates = {}
+    user_updates = {}
+
+    if body.full_name is not None and body.full_name != ben_user.full_name:
+        user_updates["full_name"] = body.full_name.strip()
+    if body.phone is not None:
+        val = body.phone.strip() or None
+        if val != ben_user.phone:
+            user_updates["phone"] = val
+    if body.gender is not None and body.gender != ben_patient.gender:
+        patient_updates["gender"] = body.gender
+    if body.date_of_birth is not None and body.date_of_birth != ben_patient.date_of_birth:
+        patient_updates["date_of_birth"] = body.date_of_birth
+    if body.blood_group is not None and body.blood_group != ben_patient.blood_group:
+        patient_updates["blood_group"] = body.blood_group
+    if body.address is not None:
+        val = body.address.strip() or None
+        if val != ben_patient.address:
+            patient_updates["address"] = val
+    if body.emergency_contact_name is not None:
+        val = body.emergency_contact_name.strip() or None
+        if val != ben_patient.emergency_contact_name:
+            patient_updates["emergency_contact_name"] = val
+    if body.emergency_contact_phone is not None:
+        val = body.emergency_contact_phone.strip() or None
+        if val != ben_patient.emergency_contact_phone:
+            patient_updates["emergency_contact_phone"] = val
+
+    # Update relationship type if changed
+    if body.relationship_type is not None and body.relationship_type != rel_row["relationship_type"]:
+        await db.execute(
+            sql_text("UPDATE patient_relationships SET relationship_type = :rt WHERE id = :id"),
+            {"rt": body.relationship_type, "id": rel_id},
+        )
+
+    try:
+        if user_updates:
+            ben_user = await UserModel.update(db, ben_user.id, **user_updates)
+        if patient_updates:
+            ben_patient = await PatientModel.update(db, ben_patient.id, **patient_updates)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        msg = str(e).lower()
+        if "unique" in msg:
+            raise HTTPException(400, "A value you entered conflicts with an existing record.")
+        raise HTTPException(500, f"Update failed: {e}")
+
+    # Re-fetch relationship to get updated data
+    result2 = await db.execute(
+        sql_text("SELECT * FROM patient_relationships WHERE id = :id"),
+        {"id": rel_id},
+    )
+    updated_rel_row = result2.mappings().first()
+    rel_obj = PatientRelationship(**dict(updated_rel_row))
+
+    return _build_relationship_response(rel_obj, ben_user, ben_patient)
 
 
 # ─── GET /search — staff search patients by name/phone ───────

@@ -213,6 +213,64 @@ async def get_my_relationships(ctx: RunContextWrapper) -> str:
     return _j(await _api("GET", "/patients/me/relationships", ctx.context["token"]))
 
 
+@function_tool
+async def update_family_member(
+    ctx: RunContextWrapper,
+    relationship_id: str,
+    full_name: str = "",
+    phone: str = "",
+    gender: str = "",
+    date_of_birth: str = "",
+    blood_group: str = "",
+    address: str = "",
+    relationship_type: str = "",
+    emergency_contact_name: str = "",
+    emergency_contact_phone: str = "",
+) -> str:
+    """Update a family member's details. Only include fields that need changing.
+    Args:
+        relationship_id: The relationship_id from get_my_relationships.
+        full_name: New full name (leave empty to keep current).
+        phone: New phone number (leave empty to keep current).
+        gender: New gender - male/female/other (leave empty to keep current).
+        date_of_birth: New DOB as YYYY-MM-DD (leave empty to keep current).
+        blood_group: New blood group like A+, O- etc (leave empty to keep current).
+        address: New address (leave empty to keep current).
+        relationship_type: New relationship - spouse/parent/child/sibling/guardian/other (leave empty to keep current).
+        emergency_contact_name: Emergency contact name (leave empty to keep current).
+        emergency_contact_phone: Emergency contact phone (leave empty to keep current).
+    """
+    payload = {}
+    if full_name:
+        payload["full_name"] = full_name
+    if phone:
+        payload["phone"] = phone
+    if gender:
+        payload["gender"] = gender
+    if date_of_birth:
+        payload["date_of_birth"] = date_of_birth
+    if blood_group:
+        payload["blood_group"] = blood_group
+    if address:
+        payload["address"] = address
+    if relationship_type:
+        payload["relationship_type"] = relationship_type
+    if emergency_contact_name:
+        payload["emergency_contact_name"] = emergency_contact_name
+    if emergency_contact_phone:
+        payload["emergency_contact_phone"] = emergency_contact_phone
+
+    if not payload:
+        return _j({"error": "No fields provided to update"})
+
+    return _j(await _api(
+        "PUT",
+        f"/patients/me/relationships/{relationship_id}/beneficiary",
+        ctx.context["token"],
+        payload=payload,
+    ))
+
+
 # ═══════════════════════════════════════════════════════════════
 #  TOOLS — Queue Management (Doctor/Nurse/Admin)
 # ═══════════════════════════════════════════════════════════════
@@ -661,7 +719,8 @@ async def admin_update_config(ctx: RunContextWrapper, key: str, value: str) -> s
 _INFO_TOOLS = [list_departments, list_doctors, get_doctor_details, get_doctor_sessions, get_operations_board]
 
 _PATIENT_TOOLS = [book_appointment, cancel_appointment, undo_cancel_appointment,
-                  get_my_appointments, get_my_profile, get_my_relationships]
+                  get_my_appointments, get_my_profile, get_my_relationships,
+                  update_family_member]
 
 _QUEUE_TOOLS = [get_queue, checkin_patient, call_patient, call_next_patient,
                 complete_appointment, mark_no_show, escalate_priority,
@@ -694,14 +753,21 @@ You help patients do everything their dashboard can do, via natural conversation
 - Browse doctors and departments, check availability
 - Book appointments (find doctor → pick session → pick slot → book)
 - View, cancel, or undo-cancel their appointments
-- View their profile and family members
+- View their profile and family members with FULL details
+- Update family member details (name, phone, blood group, relationship, etc.)
 
 RULES:
 - Use tools to get REAL data — never guess doctors, sessions, or IDs
 - Confirm before booking or cancelling
 - Never provide medical diagnoses — only help with logistics
 - Keep responses concise and friendly
-- When a patient describes symptoms, look up matching departments then find doctors in that department""",
+- When a patient describes symptoms, look up matching departments then find doctors in that department
+- When asked about family members, use get_my_relationships to fetch their details.
+  The response includes full beneficiary info: beneficiary_name, beneficiary_phone,
+  beneficiary_gender, beneficiary_age, beneficiary_blood_group, beneficiary_date_of_birth,
+  beneficiary_abha_id, beneficiary_address, beneficiary_email,
+  beneficiary_emergency_contact_name, beneficiary_emergency_contact_phone.
+  Always show ALL available details when asked — never say "not available" if the data is in the response.""",
     },
     "doctor": {
         "tools": _INFO_TOOLS + _QUEUE_TOOLS + _SESSION_TOOLS,
