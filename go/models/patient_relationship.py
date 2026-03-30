@@ -68,6 +68,7 @@ class RelationshipModel:
             {"id": relationship_id},
         )
         row = result.mappings().first()
+        await db.commit()  # Persist changes to database
         return PatientRelationship(**row) if row else None
 
     @staticmethod
@@ -136,4 +137,5 @@ class RelationshipModel:
             text("DELETE FROM patient_relationships WHERE id = :id"),
             {"id": rel_id},
         )
+        await db.commit()  # Persist changes to database
         return result.rowcount > 0

@@ -52,6 +52,7 @@ class NotificationModel:
             },
         )
         row = result.mappings().one()
+        await db.commit()  # Persist changes to database
         return NotificationLog(**row)
 
     @staticmethod
@@ -79,6 +80,7 @@ class NotificationModel:
                 """),
                 {"id": log_id, "status": status, "error": error_message},
             )
+        await db.commit()  # Persist changes to database
         return result.rowcount > 0
 
     @staticmethod

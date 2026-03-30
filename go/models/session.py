@@ -203,6 +203,7 @@ class SessionModel:
             {"id": session_id, "delta": delta},
         )
         row = result.mappings().first()
+        await db.commit()  # Persist changes to database
         return Session(**row) if row else None
 
     # ─── Real-time: Doctor Check-in & Overtime ────────────────
@@ -231,6 +232,7 @@ class SessionModel:
             {"id": session_id},
         )
         row = result.mappings().first()
+        await db.commit()  # Persist changes to database
         return Session(**row) if row else None
 
     @staticmethod
@@ -256,6 +258,7 @@ class SessionModel:
             {"id": session_id, "new_end": new_end_time, "note_val": note_val},
         )
         row = result.mappings().first()
+        await db.commit()  # Persist changes to database
         return Session(**row) if row else None
 
     @staticmethod
@@ -264,6 +267,7 @@ class SessionModel:
             text("UPDATE sessions SET status = 'cancelled' WHERE id = :id AND status IN ('active', 'inactive')"),
             {"id": session_id},
         )
+        await db.commit()  # Persist changes to database
         return result.rowcount > 0
 
     @staticmethod
@@ -272,6 +276,7 @@ class SessionModel:
             text("UPDATE sessions SET status = 'completed' WHERE id = :id AND status = 'active'"),
             {"id": session_id},
         )
+        await db.commit()  # Persist changes to database
         return result.rowcount > 0
 
     @staticmethod
@@ -281,4 +286,5 @@ class SessionModel:
             text("UPDATE sessions SET status = 'active' WHERE id = :id AND status = 'inactive'"),
             {"id": session_id},
         )
+        await db.commit()  # Persist changes to database
         return result.rowcount > 0

@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+client_secret.json
+hmsnotifyservice.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# SQLite (legacy — replaced by MongoDB)
+chat_sessions.db
+chat_sessions.db-shm
+chat_sessions.db-wal
+
+# ChromaDB data
+chroma_data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Screenshots / temp files
+*.png
+*.jpg
+*.jpeg
+
+# Byte-compiled
+*.pyc

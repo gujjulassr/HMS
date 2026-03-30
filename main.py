@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import init_db, close_db
+from go.services.mongo_chat_store import ensure_indexes as mongo_ensure_indexes, close_mongo
 from api.routes.auth import router as auth_router
 from api.routes.patient import router as patient_router
 from api.routes.doctor import router as doctor_router
@@ -16,6 +17,7 @@ from api.routes.session_mgmt import router as session_mgmt_router
 from api.routes.queue import router as queue_router
 from api.routes.admin import router as admin_router
 from api.routes.chat import router as chat_router
+from api.routes.rating import router as rating_router
 
 
 # ─── Lifespan: startup + shutdown events ─────────────────────
@@ -26,7 +28,9 @@ async def lifespan(app: FastAPI):
     Shutdown: close connection pool (releases DB connections)
     """
     await init_db()
+    await mongo_ensure_indexes()
     yield
+    await close_mongo()
     await close_db()
 
 
@@ -70,3 +74,5 @@ app.include_router(queue_router, prefix="/api/queue", tags=["Queue"])
 app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
 
 app.include_router(chat_router, prefix="/api/chat", tags=["Chat"])
+
+app.include_router(rating_router, prefix="/api/ratings", tags=["Ratings"])

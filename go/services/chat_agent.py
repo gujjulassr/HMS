@@ -8,12 +8,11 @@ Each role gets exactly the tools that match its dashboard capabilities.
 import json
 import logging
 import os
-import pathlib
 from datetime import date
 from typing import Optional
 
 import httpx
-from agents import Agent, Runner, SQLiteSession, function_tool, RunContextWrapper
+from agents import Agent, Runner, function_tool, RunContextWrapper
 from agents.memory import OpenAIResponsesCompactionSession
 
 from config import get_settings
@@ -188,16 +187,55 @@ async def get_operations_board(ctx: RunContextWrapper, board_date: str = "", dep
 # ═══════════════════════════════════════════════════════════════
 
 @function_tool
-async def book_appointment(ctx: RunContextWrapper, session_id: str, slot_number: int, beneficiary_patient_id: str = "") -> str:
+async def book_appointment(ctx: RunContextWrapper, session_id: str, preferred_time: str = "", slot_number: int = 0, beneficiary_patient_id: str = "") -> str:
     """Book an appointment for self or a family member.
     Args:
         session_id: UUID of the session.
-        slot_number: Slot number (1-based).
+        preferred_time: Desired time in HH:MM 24-hour format (e.g. "11:30", "09:00", "14:15"). ALWAYS use this instead of slot_number when the user mentions a time.
+        slot_number: Slot number (1-based). Only use this if the user explicitly says a slot number. Otherwise use preferred_time.
         beneficiary_patient_id: Patient UUID to book for. Empty = book for self.
     """
     pid = beneficiary_patient_id or ctx.context.get("patient_id", "")
     if not pid:
         return _j({"error": "No patient ID. Provide beneficiary_patient_id."})
+
+    # If preferred_time is given, compute the correct slot_number from session details
+    if preferred_time and slot_number <= 0:
+        try:
+            # Fetch session details to get start_time and slot_duration
+            session_data = await _api("GET", f"/sessions/{session_id}", ctx.context["token"])
+            if isinstance(session_data, dict) and "error" not in session_data:
+                start_str = session_data.get("start_time", "")
+                duration = session_data.get("slot_duration_minutes", 15)
+                total_slots = session_data.get("total_slots", 0)
+
+                # Parse start_time (could be "HH:MM" or "HH:MM:SS")
+                start_parts = str(start_str).split(":")
+                start_h, start_m = int(start_parts[0]), int(start_parts[1])
+                start_total = start_h * 60 + start_m
+
+                # Parse preferred_time
+                pref_parts = preferred_time.strip().split(":")
+                pref_h, pref_m = int(pref_parts[0]), int(pref_parts[1]) if len(pref_parts) > 1 else 0
+                pref_total = pref_h * 60 + pref_m
+
+                # Calculate slot number: (time_diff / duration) + 1
+                diff = pref_total - start_total
+                if diff >= 0:
+                    slot_number = (diff // duration) + 1
+                    if slot_number > total_slots:
+                        return _j({"error": f"Time {preferred_time} is outside session hours. Max slot is {total_slots}."})
+                else:
+                    return _j({"error": f"Time {preferred_time} is before session start ({start_str})."})
+            else:
+                return _j({"error": f"Could not fetch session details: {session_data}"})
+        except Exception as e:
+            logger.error(f"book_appointment time conversion failed: {e}", exc_info=True)
+            return _j({"error": f"Could not convert time '{preferred_time}' to slot: {e}"})
+
+    if slot_number <= 0:
+        return _j({"error": "Provide either preferred_time (e.g. '11:30') or slot_number (1-based)."})
+
     return _j(await _api("POST", "/appointments/book", ctx.context["token"],
                          payload={"session_id": session_id, "slot_number": slot_number, "beneficiary_patient_id": pid}))
 
@@ -972,9 +1010,61 @@ async def admin_update_config(ctx: RunContextWrapper, key: str, value: str) -> s
     return _j(await _api("PUT", f"/admin/config/{key}", ctx.context["token"], payload={"value": value}))
 
 
+# ─── Rating & Feedback Tools ──────────────────────────────────
+
+@function_tool
+async def submit_rating(ctx: RunContextWrapper, appointment_id: str, rating: int,
+                        review: str = "") -> str:
+    """Submit a rating for a completed appointment. Patients only.
+    Args:
+        appointment_id: The completed appointment UUID.
+        rating: 1-5 star rating.
+        review: Optional text feedback about the doctor visit.
+    """
+    payload = {"appointment_id": appointment_id, "rating": rating}
+    if review:
+        payload["review"] = review
+    return _j(await _api("POST", "/ratings", ctx.context["token"], payload=payload))
+
+
+@function_tool
+async def get_doctor_ratings(ctx: RunContextWrapper, doctor_id: str) -> str:
+    """Get recent ratings/reviews for a specific doctor.
+    Args:
+        doctor_id: The doctor UUID (from list_doctors).
+    """
+    return _j(await _api("GET", f"/ratings/doctor/{doctor_id}", ctx.context["token"]))
+
+
+@function_tool
+async def get_doctor_rating_stats(ctx: RunContextWrapper, doctor_id: str) -> str:
+    """Get average rating and total count for a doctor.
+    Args:
+        doctor_id: The doctor UUID (from list_doctors).
+    """
+    return _j(await _api("GET", f"/ratings/doctor/{doctor_id}/stats", ctx.context["token"]))
+
+
+@function_tool
+async def search_feedback(ctx: RunContextWrapper, query: str, doctor_id: str = "") -> str:
+    """Search patient feedback/reviews using natural language (RAG-powered).
+    Use this to find reviews about specific topics like 'wait times', 'bedside manner', etc.
+    Args:
+        query: Natural language search query (e.g. 'complaints about wait times', 'positive bedside manner').
+        doctor_id: Optional — filter to a specific doctor UUID.
+    """
+    from go.services.rag_service import search_reviews
+    results = search_reviews(query=query, doctor_id=doctor_id, n_results=10)
+    if not results:
+        return _j({"message": "No matching reviews found.", "results": []})
+    return _j({"total_found": len(results), "results": results})
+
+
 # ═══════════════════════════════════════════════════════════════
 #  TOOL GROUPS — organized by capability
 # ═══════════════════════════════════════════════════════════════
+
+_RATING_TOOLS = [submit_rating, get_doctor_ratings, get_doctor_rating_stats, search_feedback]
 
 _INFO_TOOLS = [list_departments, list_doctors, get_doctor_details, get_doctor_sessions]
 _STAFF_INFO_TOOLS = _INFO_TOOLS + [get_operations_board]
@@ -1015,7 +1105,7 @@ MODEL = "gpt-4o"
 
 ROLE_CONFIG = {
     "patient": {
-        "tools": _INFO_TOOLS + _PATIENT_TOOLS,
+        "tools": _INFO_TOOLS + _PATIENT_TOOLS + _RATING_TOOLS,
         "instructions": """You are the Hospital AI Assistant for PATIENTS.
 
 CRITICAL RULES:
@@ -1053,10 +1143,18 @@ OTHER CAPABILITIES:
 - Cancel/undo-cancel: cancel_appointment, undo_cancel_appointment
 - Profile & family: get_my_profile, get_my_relationships, update_family_member
   Family data includes: name, phone, gender, age, blood_group, dob, abha_id, address, email, emergency contacts.
-  Show ALL details when asked — don't say "not available" if the data exists in the response.""",
+  Show ALL details when asked — don't say "not available" if the data exists in the response.
+
+RATING & FEEDBACK:
+- After a completed appointment, patients can rate their doctor: submit_rating(appointment_id, rating, review)
+  → Get appointment_id from get_my_appointments (only completed ones can be rated)
+  → Rating: 1-5 stars. Review: optional free text.
+  → Confirm rating + review before submitting.
+- View doctor ratings: get_doctor_ratings(doctor_id), get_doctor_rating_stats(doctor_id)
+- Search feedback about a doctor: search_feedback(query, doctor_id) — e.g. "how's the wait time?" """,
     },
     "doctor": {
-        "tools": _STAFF_INFO_TOOLS + _QUEUE_TOOLS + _SESSION_TOOLS + _DOCTOR_EXTRA_TOOLS,
+        "tools": _STAFF_INFO_TOOLS + _QUEUE_TOOLS + _SESSION_TOOLS + _DOCTOR_EXTRA_TOOLS + _RATING_TOOLS,
         "instructions": """You are the Hospital AI Assistant for DOCTORS.
 
 CRITICAL RULES — follow these STRICTLY:
@@ -1098,10 +1196,15 @@ CAPABILITIES (use ONLY when the doctor asks):
   If patient ALREADY has an appointment in the queue → use set_patient_priority(name, doctor, "CRITICAL", is_emergency=True) to mark existing appointment as emergency.
   If patient has NO appointment yet → use emergency_book to create a new emergency entry.
   NEVER use emergency_book if the patient already has an appointment — it creates duplicates!
-- View other doctors/departments: list_doctors, get_operations_board""",
+- View other doctors/departments: list_doctors, get_operations_board
+
+RATING & FEEDBACK:
+- View your ratings: get_doctor_ratings(doctor_id) — use your own doctor_id
+- View your stats: get_doctor_rating_stats(doctor_id) — avg rating + count
+- Search specific feedback: search_feedback(query, doctor_id) — e.g. "complaints about wait times" """,
     },
     "nurse": {
-        "tools": _STAFF_INFO_TOOLS + _QUEUE_TOOLS + _SESSION_TOOLS + _STAFF_BOOK_TOOLS,
+        "tools": _STAFF_INFO_TOOLS + _QUEUE_TOOLS + _SESSION_TOOLS + _STAFF_BOOK_TOOLS + _RATING_TOOLS,
         "instructions": """You are the Hospital AI Assistant for NURSES.
 
 CRITICAL RULES:
@@ -1158,10 +1261,14 @@ CAPABILITIES (use when asked):
   Show ALL departments when asked about operations.
 
 BOOKING FLOW: search_patients → if found use staff_book, if not found use staff_register_and_book → pick doctor/session/slot → book.
-REASSIGNMENT: Keep same doctor/session unless nurse says otherwise. Calculate slot from time.""",
+REASSIGNMENT: Keep same doctor/session unless nurse says otherwise. Calculate slot from time.
+
+RATING & FEEDBACK:
+- View doctor ratings: get_doctor_ratings(doctor_id), get_doctor_rating_stats(doctor_id)
+- Search specific feedback: search_feedback(query, doctor_id) — e.g. "what do patients say about wait times for Dr. Meera?" """,
     },
     "admin": {
-        "tools": _STAFF_INFO_TOOLS + _QUEUE_TOOLS + _SESSION_TOOLS + _STAFF_BOOK_TOOLS + _ADMIN_TOOLS,
+        "tools": _STAFF_INFO_TOOLS + _QUEUE_TOOLS + _SESSION_TOOLS + _STAFF_BOOK_TOOLS + _ADMIN_TOOLS + _RATING_TOOLS,
         "instructions": """You are the Hospital AI Assistant for ADMINS.
 
 CRITICAL RULES:
@@ -1212,7 +1319,13 @@ CAPABILITIES (use when asked):
   If patient ALREADY has an appointment → use set_patient_priority(name, doctor, "CRITICAL", is_emergency=True) to mark existing appointment as emergency.
   If patient has NO appointment → use emergency_book to create a new emergency entry.
   NEVER use emergency_book if the patient already has an appointment — it creates duplicates!
-- Info: list_departments, list_doctors, get_doctor_sessions, get_operations_board""",
+- Info: list_departments, list_doctors, get_doctor_sessions, get_operations_board
+
+RATING & FEEDBACK (admin has full access):
+- View any doctor's ratings: get_doctor_ratings(doctor_id), get_doctor_rating_stats(doctor_id)
+- Search patient feedback with natural language (RAG): search_feedback(query, doctor_id)
+  Examples: "common complaints", "positive feedback about bedside manner", "wait time issues"
+  Use this to analyze patient satisfaction trends across doctors.""",
     },
 }
 
@@ -1237,22 +1350,22 @@ def _build_agent(role: str) -> Agent:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  SESSION-BASED CONVERSATION MEMORY (OpenAI Agents SDK Sessions)
+#  SESSION-BASED CONVERSATION MEMORY (MongoDB + Compaction)
 # ═══════════════════════════════════════════════════════════════
 #
-#  Each user gets a persistent session backed by SQLite.
+#  Each user gets a persistent session backed by MongoDB.
 #  The SDK handles history automatically — we just call session.run().
-#  OpenAIResponsesCompactionSession wraps the SQLite session and
+#  OpenAIResponsesCompactionSession wraps the MongoDB session and
 #  automatically SUMMARIZES older messages when the context grows,
 #  so we never send the full raw history. This is efficient:
 #    - Recent messages: kept verbatim (high fidelity)
 #    - Older messages: compressed into a summary (saves tokens)
 #    - Tool call results: preserved for context
 #
-#  DB file lives at: HMS/chat_sessions.db
+#  MongoDB collection: chat_messages (in dpms_v2_chat database)
 #
 
-_SESSION_DB_PATH = str(pathlib.Path(__file__).resolve().parent.parent.parent / "chat_sessions.db")
+from go.services.mongo_chat_store import MongoSession, get_conversation_history_mongo
 
 # Track active sessions per user: user_id -> (compaction session, last_access_time)
 _active_sessions: dict[str, tuple[OpenAIResponsesCompactionSession, float]] = {}
@@ -1273,7 +1386,7 @@ def _evict_old_sessions():
 
 
 def _get_session(user_id: str) -> OpenAIResponsesCompactionSession:
-    """Get or create a compacted session for a user."""
+    """Get or create a compacted session for a user (MongoDB-backed)."""
     import time
     if user_id in _active_sessions:
         session, _ = _active_sessions[user_id]
@@ -1282,10 +1395,7 @@ def _get_session(user_id: str) -> OpenAIResponsesCompactionSession:
 
     _evict_old_sessions()
 
-    underlying = SQLiteSession(
-        session_id=user_id,
-        db_path=_SESSION_DB_PATH,
-    )
+    underlying = MongoSession(session_id=user_id)
     session = OpenAIResponsesCompactionSession(
         session_id=user_id,
         underlying_session=underlying,
@@ -1297,71 +1407,17 @@ def _get_session(user_id: str) -> OpenAIResponsesCompactionSession:
 async def clear_conversation(user_id: str) -> None:
     """Clear a user's conversation (called on 'New Chat')."""
     _active_sessions.pop(user_id, None)
-    # Also clear from SQLite so old history doesn't leak into new chat
+    # Also clear from MongoDB so old history doesn't leak into new chat
     try:
-        underlying = SQLiteSession(session_id=user_id, db_path=_SESSION_DB_PATH)
+        underlying = MongoSession(session_id=user_id)
         await underlying.clear_session()
     except Exception as e:
         logger.warning(f"Could not clear session DB for {user_id}: {e}")
 
 
 async def get_conversation_history(user_id: str, limit: int = 100) -> list[dict]:
-    """Retrieve stored conversation history for a user.
-
-    Returns a list of {role: 'user'|'assistant', content: str} dicts
-    suitable for displaying in the Streamlit chat UI.
-    """
-    try:
-        underlying = SQLiteSession(session_id=user_id, db_path=_SESSION_DB_PATH)
-        items = await underlying.get_items(limit=limit)
-        messages = []
-        for item in items:
-            if isinstance(item, dict):
-                role = item.get("role", "")
-                content_parts = item.get("content", [])
-                # Extract text from content parts
-                text = ""
-                if isinstance(content_parts, str):
-                    text = content_parts
-                elif isinstance(content_parts, list):
-                    for part in content_parts:
-                        if isinstance(part, dict):
-                            if part.get("type") in ("input_text", "output_text", "text"):
-                                text += part.get("text", "")
-                        elif isinstance(part, str):
-                            text += part
-                if text and role in ("user", "assistant"):
-                    # Strip injected system reminders from user messages
-                    if role == "user":
-                        import re
-                        text = re.sub(r'\[MANDATORY:.*?\]\n*', '', text, flags=re.DOTALL).strip()
-                        text = re.sub(r'\[SYSTEM REMINDER:.*?\]\n*', '', text, flags=re.DOTALL).strip()
-                    if text:
-                        messages.append({"role": role, "content": text})
-            elif hasattr(item, "role") and hasattr(item, "content"):
-                # Object-style item
-                role = item.role
-                content = item.content
-                text = ""
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    for part in content:
-                        if hasattr(part, "text"):
-                            text += part.text
-                        elif isinstance(part, dict) and "text" in part:
-                            text += part["text"]
-                if text and role in ("user", "assistant"):
-                    if role == "user":
-                        import re
-                        text = re.sub(r'\[MANDATORY:.*?\]\n*', '', text, flags=re.DOTALL).strip()
-                        text = re.sub(r'\[SYSTEM REMINDER:.*?\]\n*', '', text, flags=re.DOTALL).strip()
-                    if text:
-                        messages.append({"role": role, "content": text})
-        return messages
-    except Exception as e:
-        logger.warning(f"Could not retrieve history for {user_id}: {e}")
-        return []
+    """Retrieve stored conversation history for a user from MongoDB."""
+    return await get_conversation_history_mongo(user_id, limit=limit)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1379,7 +1435,7 @@ async def run_chat(
 ) -> str:
     """Run the chatbot agent with a user message and return the reply.
 
-    Uses SQLiteSession + compaction for efficient conversation memory.
+    Uses MongoDB + compaction for efficient conversation memory.
     The SDK handles context trimming/summarization automatically —
     old messages get compressed, recent ones stay verbatim.
     Client only sends the new message. No history needed.

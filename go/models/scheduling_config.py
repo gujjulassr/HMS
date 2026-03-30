@@ -71,4 +71,5 @@ class ConfigModel:
             {"key": key, "value": json.dumps(value), "updated_by": updated_by},
         )
         row = result.mappings().first()
+        await db.commit()  # Persist changes to database
         return SchedulingConfig(**row) if row else None

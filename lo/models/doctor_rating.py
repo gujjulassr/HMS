@@ -1,7 +1,6 @@
 """
 LO Model: doctor_ratings
 Post-visit feedback. One rating per appointment.
-Review text gets embedded in ChromaDB for RAG.
 """
 from uuid import UUID
 from datetime import datetime
@@ -54,6 +53,7 @@ class RatingModel:
             },
         )
         row = result.mappings().one()
+        await db.commit()  # Persist changes to database
         return DoctorRating(**row)
 
     @staticmethod
@@ -97,3 +97,42 @@ class RatingModel:
         )
         row = result.mappings().first()
         return DoctorRating(**row) if row else None
+
+    @staticmethod
+    async def get_reviews_for_search(
+        db: AsyncSession, doctor_id: UUID = None, limit: int = 30
+    ) -> list[dict]:
+        """Get recent reviews with doctor names — used by AI search_feedback tool.
+
+        Returns dicts with: doctor_name, rating, review, sentiment_score, created_at.
+        If doctor_id is provided, filters to that doctor. Otherwise returns all.
+        """
+        if doctor_id:
+            result = await db.execute(
+                text("""
+                    SELECT dr.rating, dr.review, dr.sentiment_score, dr.created_at,
+                           u.full_name as doctor_name, d.specialization
+                    FROM doctor_ratings dr
+                    JOIN doctors d ON dr.doctor_id = d.id
+                    JOIN users u ON d.user_id = u.id
+                    WHERE dr.doctor_id = :did AND dr.review IS NOT NULL AND dr.review != ''
+                    ORDER BY dr.created_at DESC
+                    LIMIT :limit
+                """),
+                {"did": doctor_id, "limit": limit},
+            )
+        else:
+            result = await db.execute(
+                text("""
+                    SELECT dr.rating, dr.review, dr.sentiment_score, dr.created_at,
+                           u.full_name as doctor_name, d.specialization
+                    FROM doctor_ratings dr
+                    JOIN doctors d ON dr.doctor_id = d.id
+                    JOIN users u ON d.user_id = u.id
+                    WHERE dr.review IS NOT NULL AND dr.review != ''
+                    ORDER BY dr.created_at DESC
+                    LIMIT :limit
+                """),
+                {"limit": limit},
+            )
+        return [dict(row) for row in result.mappings().all()]

@@ -109,6 +109,7 @@ class UserModel:
             fields,
         )
         row = result.mappings().first()
+        await db.commit()  # Persist changes to database
         return _row_to_user(row) if row else None
 
     @staticmethod
@@ -118,4 +119,5 @@ class UserModel:
             text("UPDATE users SET is_active = false WHERE id = :id"),
             {"id": user_id},
         )
+        await db.commit()  # Persist changes to database
         return result.rowcount > 0

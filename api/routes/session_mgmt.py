@@ -123,6 +123,37 @@ async def _notify_patients_delay(
         pass  # Email failures never block the core flow
 
 
+# ─── GET /{session_id} — fetch session details ─────────────
+
+@router.get("/{session_id}")
+async def get_session_by_id(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_role("patient", "doctor", "nurse", "admin")),
+):
+    """Get details for a specific session by its UUID."""
+    session = await SessionModel.get_by_id(db, UUID(session_id))
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    # Get doctor name
+    doctor = await DoctorModel.get_by_id(db, session.doctor_id)
+    doc_user = await UserModel.get_by_id(db, doctor.user_id) if doctor else None
+    return {
+        "session_id": str(session.id),
+        "doctor_id": str(session.doctor_id),
+        "doctor_name": doc_user.full_name if doc_user else None,
+        "session_date": str(session.session_date),
+        "start_time": str(session.start_time),
+        "end_time": str(session.end_time),
+        "slot_duration_minutes": session.slot_duration_minutes,
+        "max_patients_per_slot": session.max_patients_per_slot,
+        "total_slots": session.total_slots,
+        "booked_count": session.booked_count,
+        "delay_minutes": session.delay_minutes,
+        "status": session.status,
+    }
+
+
 # ─── POST /checkin — doctor arrives ──────────────────────────
 
 @router.post("/checkin", response_model=SessionStatusResponse)

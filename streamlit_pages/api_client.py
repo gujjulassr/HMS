@@ -746,3 +746,32 @@ def chat_tts(text: str, voice: str = "alloy") -> bytes:
     )
     r.raise_for_status()
     return r.content  # raw mp3 bytes
+
+
+# ─── Ratings / Feedback ──────────────────────────────────────
+
+def submit_rating(appointment_id: str, rating: int, review: str = "") -> dict:
+    """POST /ratings — Submit a rating for a completed appointment."""
+    payload = {"appointment_id": appointment_id, "rating": rating}
+    if review:
+        payload["review"] = review
+    r = _request("POST", f"{BASE_URL}/ratings", json=payload)
+    if r.status_code >= 400:
+        _raise_api_error(r)
+    return r.json()
+
+
+def get_doctor_ratings(doctor_id: str) -> list:
+    """GET /ratings/doctor/{id} — Get ratings for a doctor."""
+    r = _request("GET", f"{BASE_URL}/ratings/doctor/{doctor_id}")
+    if r.status_code >= 400:
+        return []
+    return r.json()
+
+
+def get_doctor_rating_stats(doctor_id: str) -> dict:
+    """GET /ratings/doctor/{id}/stats — Get avg rating stats."""
+    r = _request("GET", f"{BASE_URL}/ratings/doctor/{doctor_id}/stats")
+    if r.status_code >= 400:
+        return {"avg_rating": 0, "total_ratings": 0}
+    return r.json()

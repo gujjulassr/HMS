@@ -972,6 +972,39 @@ def page_my_appointments():
                 elif _appt_status == "cancelled" and appt_is_past:
                     st.caption("⏰ Past appointment — cannot rebook.")
 
+                # ── Rating form for completed appointments ──
+                if _appt_status == "completed":
+                    _rating_key = f"rating_{_appt_id}"
+                    # Check if already in "show form" state
+                    if st.session_state.get(f"show_rate_{_appt_id}"):
+                        st.markdown("---")
+                        st.markdown("**⭐ Rate this visit**")
+                        _stars = st.slider("Rating", 1, 5, 4, key=f"stars_{_appt_id}")
+                        _review = st.text_area("Review (optional)", key=f"review_{_appt_id}",
+                                               placeholder="How was your experience?", max_chars=2000)
+                        rc1, rc2 = st.columns(2)
+                        if rc1.button("Submit Rating", key=f"submit_rate_{_appt_id}", type="primary"):
+                            try:
+                                api.submit_rating(_appt_id, _stars, _review)
+                                st.session_state[f"rated_{_appt_id}"] = True
+                                st.session_state.pop(f"show_rate_{_appt_id}", None)
+                                st.success("Thank you for your feedback!")
+                                st.rerun()
+                            except Exception as e:
+                                err_msg = str(e)
+                                if "already been rated" in err_msg:
+                                    st.info("You've already rated this appointment.")
+                                    st.session_state[f"rated_{_appt_id}"] = True
+                                else:
+                                    st.error(f"Could not submit rating: {e}")
+                        if rc2.button("Cancel", key=f"cancel_rate_{_appt_id}"):
+                            st.session_state.pop(f"show_rate_{_appt_id}", None)
+                            st.rerun()
+                    elif not st.session_state.get(f"rated_{_appt_id}"):
+                        if st.button("⭐ Rate this visit", key=f"rate_btn_{_appt_id}"):
+                            st.session_state[f"show_rate_{_appt_id}"] = True
+                            st.rerun()
+
 
 def page_patient_profile():
     tc1, tc2 = st.columns([6, 1])

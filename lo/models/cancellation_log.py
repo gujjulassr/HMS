@@ -52,6 +52,7 @@ class CancellationModel:
             },
         )
         row = result.mappings().one()
+        await db.commit()  # Persist changes to database
         return CancellationLog(**row)
 
     @staticmethod
