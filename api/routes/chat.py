@@ -50,6 +50,7 @@ async def send_message(
     """
     try:
         patient_id = ""
+        doctor_id = ""
         if user.role == "patient":
             from database import async_session
             async with async_session() as db:
@@ -57,6 +58,13 @@ async def send_message(
                 patient = await PatientModel.get_by_user_id(db, user.id)
                 if patient:
                     patient_id = str(patient.id)
+        elif user.role == "doctor":
+            from database import async_session
+            async with async_session() as db:
+                from go.models.doctor import DoctorModel
+                doctor = await DoctorModel.get_by_user_id(db, user.id)
+                if doctor:
+                    doctor_id = str(doctor.id)
 
         reply = await run_chat(
             message=req.message,
@@ -64,6 +72,7 @@ async def send_message(
             role=user.role,
             user_id=str(user.id),
             patient_id=patient_id,
+            doctor_id=doctor_id,
             patient_context=req.patient_context or "",
         )
 

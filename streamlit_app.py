@@ -10,7 +10,8 @@ Pages by role:
   Admin   → Session & Queue, Emergency Book, Cancel Session
 
 Key patterns:
-  - can_act = is_today AND sess_status == "active"  (guards all action buttons)
+  - can_act_today = is_today AND sess_status == "active"  (guards queue-management buttons)
+  - can_add_patient = (is_today OR is_future) AND sess_status == "active"  (guards Add Patient)
   - No auto-cancel/auto-complete. Doctor manually ends session when leaving.
     On "End Session": booked → no_show, checked_in → cancelled, in_progress blocks it.
   - st.session_state["dd_msg"] for persistent messages across Streamlit reruns
@@ -358,14 +359,8 @@ def _smart_session_picker(key: str) -> str | None:
     # Step 3: Date filter
     from datetime import date, timedelta
     today = date.today()
-    date_options = {
-        "Today": (today, today),
-        "Tomorrow": (today + timedelta(days=1), today + timedelta(days=1)),
-        "This Week": (today, today + timedelta(days=6)),
-        "All Dates": (None, None),
-    }
-    date_choice = st.selectbox("📅 Date", list(date_options.keys()), key=f"date_{key}")
-    from_d, to_d = date_options[date_choice]
+    date_pick = st.date_input("📅 Date", value=today, key=f"date_{key}")
+    from_d, to_d = date_pick, date_pick
 
     # For single-day picks (Today/Tomorrow), use DB function that auto-creates sessions
     if from_d and from_d == to_d:
@@ -384,7 +379,7 @@ def _smart_session_picker(key: str) -> str | None:
     usable_sessions = [s for s in sessions if s["status"] in ("active", "inactive", "completed")]
 
     if not usable_sessions:
-        st.info(f"No sessions found for {chosen_doc['full_name']} on {date_choice.lower()}.")
+        st.info(f"No sessions found for {chosen_doc['full_name']} on {date_pick}.")
         return None
 
     # Step 4: Session (time) picker — show status in label
@@ -787,15 +782,29 @@ def page_book_appointment():
     slot_duration = selected_sess.get("slot_duration_minutes", 15)
     start_time = str(selected_sess.get("start_time", "09:00"))
 
-    # Build slot options with times
-    slot_options = []
+    # Build slot options with times — filter out past slots for today
+    from datetime import date as _pb_d, datetime as _pb_dt
+    _pb_is_today = str(selected_sess.get("session_date", "")) == str(_pb_d.today())
+    _pb_now_min = _pb_dt.now().hour * 60 + _pb_dt.now().minute
+    slot_options = []  # list of (slot_number, label)
     for i in range(1, total_slots + 1):
         slot_time = _calc_slot_time(start_time, slot_duration, i)
-        slot_options.append(f"Slot {i} — {slot_time}")
+        if _pb_is_today:
+            try:
+                hh, mm = int(start_time[:2]), int(start_time[3:5])
+                t_min = hh * 60 + mm + (i - 1) * slot_duration
+                if t_min + slot_duration <= _pb_now_min:
+                    continue  # slot already passed
+            except Exception:
+                pass
+        slot_options.append((i, f"Slot {i} — {slot_time}"))
 
+    if not slot_options:
+        st.warning("All time slots for this session have already passed. Please pick a different session.")
+        return
     selected_slot_idx = st.selectbox("Pick a time slot", range(len(slot_options)),
-                                      format_func=lambda i: slot_options[i])
-    slot_num = selected_slot_idx + 1
+                                      format_func=lambda idx: slot_options[idx][1])
+    slot_num = slot_options[selected_slot_idx][0]
 
     # ── Step 4: Who is this appointment for? ──
     st.divider()
@@ -914,7 +923,7 @@ def page_my_appointments():
             with st.container(border=True):
                 c1, c2, c3 = st.columns([3, 3, 1])
                 c1.write(f"**🩺 {a.get('doctor_name', 'Doctor')}** — {a.get('specialization', '')}")
-                appt_time = str(a.get("start_time", ""))[:5]
+                appt_time = a.get("slot_time") or str(a.get("start_time", ""))[:5]
                 c2.write(f"📅 {a.get('session_date', '')}  •  🕐 {appt_time}  •  Slot {a.get('slot_number', '?')}")
                 c3.write(_status_badge(a.get("status", "unknown")))
                 # Additional info row
@@ -1501,8 +1510,11 @@ def page_doctor_dashboard():
     m3.metric("Done", n_done)
     m4.metric("No-show", n_noshow)
 
-    # ── Quick actions (only today + active) ──
-    can_act = is_today and sess_status == "active"
+    # ── Quick actions ──
+    # Queue-management (check-in, extend, delay, end) → today + active only
+    # Add Patient → today OR future + active (doctor can book emergency patients ahead)
+    can_act_today = is_today and sess_status == "active"
+    can_add_patient = (is_today or is_future) and sess_status == "active"
 
     # Show any pending messages from previous action
     if "dd_msg" in st.session_state:
@@ -1512,73 +1524,89 @@ def page_doctor_dashboard():
         else:
             st.error(msg)
 
-    if can_act:
+    if can_act_today or can_add_patient:
+        # Show all 5 columns but only enable relevant buttons
         ac1, ac2, ac3, ac4, ac5 = st.columns(5)
         with ac1:
-            if st.button("I'm Here", key="dash_checkin_btn", use_container_width=True):
-                try:
-                    r = api.doctor_checkin({"session_id": sid})
-                    st.success(r.get("message", "Checked in!"))
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"{e}")
+            if can_act_today:
+                if st.button("I'm Here", key="dash_checkin_btn", use_container_width=True):
+                    try:
+                        r = api.doctor_checkin({"session_id": sid})
+                        st.success(r.get("message", "Checked in!"))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"{e}")
         with ac2:
             if st.button("Add Patient", key="dash_add_pat_btn", use_container_width=True):
                 st.session_state["dd_show_add"] = not st.session_state.get("dd_show_add", False)
                 st.rerun()
         with ac3:
-            with st.popover("Extend", use_container_width=True):
-                with st.form("dash_ext", clear_on_submit=True):
-                    try:
-                        _dh, _dm = int(s_end[:2]), int(s_end[3:5])
-                        _dv = _time_cls(min(_dh + ((_dm + 30) // 60), 23), (_dm + 30) % 60)
-                    except Exception:
-                        _dv = _time_cls(18, 0)
-                    ne = st.time_input("New end time", value=_dv, key="d_ext_t")
-                    nt = st.text_input("Reason", key="d_ext_n")
-                    if st.form_submit_button("Extend"):
+            # Extend only available for afternoon sessions (start >= 14:00).
+            # Morning pending patients auto-carry to afternoon on completion.
+            _is_afternoon = False
+            try:
+                _is_afternoon = int(s_start[:2]) >= 14
+            except Exception:
+                pass
+            if can_act_today and _is_afternoon:
+                with st.popover("Extend", use_container_width=True):
+                    with st.form("dash_ext", clear_on_submit=True):
                         try:
-                            api.extend_session({"session_id": sid, "new_end_time": str(ne), "note": nt})
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"{e}")
+                            _dh, _dm = int(s_end[:2]), int(s_end[3:5])
+                            _dv = _time_cls(min(_dh + ((_dm + 30) // 60), 23), (_dm + 30) % 60)
+                        except Exception:
+                            _dv = _time_cls(18, 0)
+                        ne = st.time_input("New end time", value=_dv, key="d_ext_t")
+                        nt = st.text_input("Reason", key="d_ext_n")
+                        if st.form_submit_button("Extend"):
+                            try:
+                                api.extend_session({"session_id": sid, "new_end_time": str(ne), "note": nt})
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"{e}")
+            elif can_act_today and not _is_afternoon:
+                st.caption("Pending patients carry over to afternoon session.")
         with ac4:
-            with st.popover("Running Late", use_container_width=True):
-                st.caption("Let patients know you are running behind schedule.")
-                with st.form("dash_del", clear_on_submit=True):
-                    dl = st.number_input("Minutes late", 0, 120, q.get("delay_minutes", 0), key="d_del_m")
-                    dr = st.text_input("Reason", key="d_del_r", placeholder="e.g. Emergency case")
-                    if st.form_submit_button("Update"):
-                        try:
-                            api.update_delay({"session_id": sid, "delay_minutes": dl, "reason": dr})
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"{e}")
+            if can_act_today:
+                with st.popover("Running Late", use_container_width=True):
+                    st.caption("Let patients know you are running behind schedule.")
+                    with st.form("dash_del", clear_on_submit=True):
+                        dl = st.number_input("Minutes late", 0, 120, q.get("delay_minutes", 0), key="d_del_m")
+                        dr = st.text_input("Reason", key="d_del_r", placeholder="e.g. Emergency case")
+                        if st.form_submit_button("Update"):
+                            try:
+                                api.update_delay({"session_id": sid, "delay_minutes": dl, "reason": dr})
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"{e}")
         with ac5:
-            with st.popover("End Session", use_container_width=True):
-                st.caption("End this session. Doctor is leaving.")
-                warnings = []
-                if n_booked > 0:
-                    warnings.append(f"{n_booked} booked → no-show")
-                if n_waiting > 0:
-                    warnings.append(f"{n_waiting} checked-in → cancelled")
-                if current_pat:
-                    st.error("A patient is currently **in progress**. Complete them first.")
-                else:
-                    if warnings:
-                        st.warning("Remaining: " + " | ".join(warnings))
-                    cn = st.text_input("Note (optional)", key="d_comp_n")
-                    if st.button("End Session", type="primary", key="d_comp_btn", use_container_width=True):
-                        try:
-                            api.complete_session({"session_id": sid, "note": cn})
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"{e}")
+            if can_act_today:
+                with st.popover("End Session", use_container_width=True):
+                    st.caption("End this session. Doctor is leaving.")
+                    warnings = []
+                    if n_booked > 0:
+                        warnings.append(f"{n_booked} booked → no-show")
+                    if n_waiting > 0:
+                        warnings.append(f"{n_waiting} checked-in → cancelled")
+                    if current_pat:
+                        st.error("A patient is currently **in progress**. Complete them first.")
+                    else:
+                        if warnings:
+                            st.warning("Remaining: " + " | ".join(warnings))
+                        cn = st.text_input("Note (optional)", key="d_comp_n")
+                        if st.button("End Session", type="primary", key="d_comp_btn", use_container_width=True):
+                            try:
+                                api.complete_session({"session_id": sid, "note": cn})
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"{e}")
 
     # ── Add Patient form (toggled) ──
-    if can_act and st.session_state.get("dd_show_add"):
+    if can_add_patient and st.session_state.get("dd_show_add"):
         st.divider()
         st.subheader("Add Patient")
+        if is_future:
+            st.info(f"Booking for a future session on **{picked}**. Patient will receive a confirmation email.")
 
         # Build ALL time slots (doctor can pick any slot — their call)
         try:
@@ -1615,7 +1643,10 @@ def page_doctor_dashboard():
                 continue
             t_label = f"{t_min // 60:02d}:{t_min % 60:02d}"
             count = slot_counts.get(sn, 0)
-            is_past_slot = t_min + dur <= now_min
+            # Only mark slots as past if session is today AND session is NOT active.
+            # Active session → doctor is still working, all slots bookable.
+            # Future date → never past.
+            is_past_slot = is_today and sess_status != "active" and (t_min + dur <= now_min)
 
             if count >= max_per_slot:
                 tag = f"FULL ({count}/{max_per_slot})"
@@ -1794,7 +1825,7 @@ def page_doctor_dashboard():
     st.divider()
 
     # ── Current patient (only today + active) ──
-    if can_act and current_pat:
+    if can_act_today and current_pat:
         cp = current_pat
         cp_name = cp.get("patient_name") or "Patient"
         cp_age = f"{cp['patient_age']}y" if cp.get("patient_age") else ""
@@ -1838,182 +1869,272 @@ def page_doctor_dashboard():
                 except Exception as e:
                     st.session_state["dd_msg"] = f"❌ Error: {e}"
                     st.rerun()
-    elif can_act:
-        waiting = [e for e in all_q if e["status"] == "checked_in"]
-        if waiting:
-            nxt = waiting[0]
-            st.info(f"Next: **{nxt.get('patient_name', 'Patient')}** — Slot #{nxt['slot_number']}")
-            if st.button("Call Next Patient", type="primary", key="dash_call_nxt"):
-                try:
-                    api.call_patient({"appointment_id": nxt["appointment_id"]})
-                    st.session_state["dd_msg"] = f"✅ {nxt.get('patient_name', 'Patient')} called in!"
-                    st.rerun()
-                except Exception as e:
-                    st.session_state["dd_msg"] = f"❌ Call failed: {e}"
-                    st.rerun()
+    elif can_act_today or can_add_patient:
+        waiting_normal = [e for e in all_q if e["status"] == "checked_in" and not e.get("is_emergency")]
+        waiting_emg = [e for e in all_q if e["status"] == "checked_in" and e.get("is_emergency")]
+        booked = [e for e in all_q if e["status"] == "booked"]
+        if waiting_emg:
+            emg_p = waiting_emg[0]
+            st.warning(f"🚨 Emergency: **{emg_p.get('patient_name', 'Patient')}** — Priority: {emg_p.get('priority_tier', 'CRITICAL')}")
+            if can_act_today:
+                dc1, dc2 = st.columns(2)
+                if dc1.button("🚨 Call Emergency Patient", type="primary", key="dash_call_emg"):
+                    try:
+                        api.call_patient({"appointment_id": emg_p["appointment_id"]})
+                        st.session_state["dd_msg"] = f"✅ Emergency patient {emg_p.get('patient_name', '')} called in!"
+                        st.rerun()
+                    except Exception as e:
+                        st.session_state["dd_msg"] = f"❌ Call failed: {e}"
+                        st.rerun()
+                if waiting_normal:
+                    nxt = waiting_normal[0]
+                    if dc2.button(f"🔔 Call {nxt.get('patient_name', 'Next')}", key="dash_call_nxt_alt"):
+                        try:
+                            api.call_patient({"appointment_id": nxt["appointment_id"]})
+                            st.session_state["dd_msg"] = f"✅ {nxt.get('patient_name', 'Patient')} called in!"
+                            st.rerun()
+                        except Exception as e:
+                            st.session_state["dd_msg"] = f"❌ Call failed: {e}"
+                            st.rerun()
+        elif waiting_normal:
+            nxt = waiting_normal[0]
+            _nxt_slot_info = f"Slot #{nxt['slot_number']} ({_slot_t(nxt)})" if nxt.get("slot_number", 0) > 0 else ""
+            st.info(f"Next: **{nxt.get('patient_name', 'Patient')}** {_nxt_slot_info}")
+            if can_act_today:
+                if st.button("Call Next Patient", type="primary", key="dash_call_nxt"):
+                    try:
+                        api.call_patient({"appointment_id": nxt["appointment_id"]})
+                        st.session_state["dd_msg"] = f"✅ {nxt.get('patient_name', 'Patient')} called in!"
+                        st.rerun()
+                    except Exception as e:
+                        st.session_state["dd_msg"] = f"❌ Call failed: {e}"
+                        st.rerun()
+        elif booked:
+            st.info(f"**{len(booked)}** patient(s) booked, awaiting check-in. No one checked in yet.")
         else:
-            st.caption("No patients waiting.")
+            st.caption("No patients in this session yet.")
 
-    if can_act:
+    if can_act_today or can_add_patient:
         st.divider()
 
     # ── Patient Table (always shown — history or live) ──
-    st.subheader("Patients" if can_act else "Patient History")
+    st.subheader("Patients" if (can_act_today or can_add_patient) else "Patient History")
     if not all_q:
         st.info("No patients in this session.")
     else:
-        sorted_q = sorted(all_q, key=lambda e: e.get("slot_number", 0))
+        # ── Filters ──
+        flt1, flt2, flt3 = st.columns(3)
+        status_options = ["All"] + sorted({e["status"].replace("_", " ").title() for e in all_q})
+        sel_status = flt1.selectbox("Filter by status", status_options, key="dd_flt_status")
 
-        # ── Table header ──
-        hdr_cols = st.columns([0.5, 1, 2, 1.5, 1.2, 1.2, 2])
-        hdr_cols[0].markdown("**#**")
-        hdr_cols[1].markdown("**Time**")
-        hdr_cols[2].markdown("**Patient**")
-        hdr_cols[3].markdown("**Status**")
-        hdr_cols[4].markdown("**Priority**")
-        hdr_cols[5].markdown("**Done**")
-        hdr_cols[6].markdown("**Action**")
-        st.divider()
+        slot_set = sorted({e.get("slot_number", 0) for e in all_q})
+        slot_labels = ["All Slots"] + [f"Slot {sn} ({_slot_t({'slot_number': sn})})" for sn in slot_set]
+        sel_slot = flt2.selectbox("Filter by slot", slot_labels, key="dd_flt_slot")
 
-        for i, entry in enumerate(sorted_q):
-            e_name = entry.get("patient_name") or "Patient"
-            e_status = entry["status"]
-            e_slot = entry.get("slot_number", "?")
-            e_time = _slot_t(entry)
-            e_prio = entry.get("priority_tier", "NORMAL")
-            e_emerg = entry.get("is_emergency", False)
-            e_appt_id = entry["appointment_id"]
+        prio_options = ["All"] + sorted({e.get("priority_tier", "NORMAL") for e in all_q})
+        sel_prio = flt3.selectbox("Filter by priority", prio_options, key="dd_flt_prio")
 
-            icons = {"in_progress": "🔄", "checked_in": "⏳", "booked": "📅", "completed": "✅", "no_show": "🚫", "cancelled": "❌"}
-            icon = icons.get(e_status, "⬜")
-            status_label = e_status.replace("_", " ").title()
-            prio_label = "🚨 EMERGENCY" if e_emerg else e_prio
+        sorted_q = sorted(all_q, key=lambda e: (e.get("slot_number", 0), e.get("slot_position", 0)))
 
-            # ── Table row ──
-            row = st.columns([0.5, 1, 2, 1.5, 1.2, 1.2, 2])
-            row[0].write(f"{e_slot}")
-            row[1].write(f"{e_time}")
-            row[2].write(f"**{e_name}**")
-            row[3].write(f"{icon} {status_label}")
-            row[4].write(prio_label)
+        # Apply filters
+        filtered_q = sorted_q
+        if sel_status != "All":
+            filtered_q = [e for e in filtered_q if e["status"].replace("_", " ").title() == sel_status]
+        if sel_slot != "All Slots":
+            try:
+                sel_sn = int(sel_slot.split(" ")[1])
+                filtered_q = [e for e in filtered_q if e.get("slot_number") == sel_sn]
+            except Exception:
+                pass
+        if sel_prio != "All":
+            filtered_q = [e for e in filtered_q if e.get("priority_tier", "NORMAL") == sel_prio]
 
-            # Done column — checkmark or checkbox
-            is_done = e_status in ("completed", "no_show", "cancelled")
-            if is_done:
-                row[5].write("✅")
-            elif e_status == "in_progress" and can_act:
-                if row[5].button("☑️", key=f"done_{i}", help="Mark as completed"):
-                    try:
-                        api.complete_appointment({"appointment_id": e_appt_id})
-                        delay = _calc_and_update_delay(sid, s_start, dur, e_slot)
-                        msg = f"✅ {e_name} completed."
-                        if delay and delay > 0:
-                            msg += f" Running {delay}min late."
-                        elif delay == 0:
-                            msg += " On schedule!"
-                        st.session_state["dd_msg"] = msg
-                        st.rerun()
-                    except Exception as ex:
-                        st.session_state["dd_msg"] = f"❌ {ex}"
-                        st.rerun()
-            else:
-                row[5].write("—")
+        if not filtered_q:
+            st.info("No patients match the selected filters.")
+        else:
+            # ── Table header ──
+            hdr_cols = st.columns([0.6, 1.2, 2, 1, 1.3, 1.2, 2.5])
+            hdr_cols[0].markdown("**Slot**")
+            hdr_cols[1].markdown("**Time**")
+            hdr_cols[2].markdown("**Patient**")
+            hdr_cols[3].markdown("**Phone**")
+            hdr_cols[4].markdown("**Status**")
+            hdr_cols[5].markdown("**Priority**")
+            hdr_cols[6].markdown("**Actions**")
+            st.divider()
 
-            # Action column
-            if not can_act:
-                row[6].write("—")
-            elif e_status == "checked_in":
-                has_in_progress = current_pat is not None
-                if has_in_progress:
-                    # Doctor already has a patient — show waiting, no call button
-                    row[6].caption("Doctor busy")
-                else:
-                    ac1, ac2, ac3 = row[6].columns(3)
-                    if ac1.button("📞", key=f"call_{i}", help="Call in this patient"):
+            for i, entry in enumerate(filtered_q):
+                e_name = entry.get("patient_name") or "Patient"
+                e_status = entry["status"]
+                e_slot = entry.get("slot_number", "?")
+                e_pos = entry.get("slot_position", 1)
+                e_time = _slot_t(entry)
+                e_prio = entry.get("priority_tier", "NORMAL")
+                e_emerg = entry.get("is_emergency", False)
+                e_appt_id = entry["appointment_id"]
+                e_phone = entry.get("patient_phone", "") or ""
+
+                icons = {"in_progress": "🔄", "checked_in": "⏳", "booked": "📅", "completed": "✅", "no_show": "🚫", "cancelled": "❌"}
+                icon = icons.get(e_status, "⬜")
+                status_label = e_status.replace("_", " ").title()
+                prio_label = "🚨 CRITICAL" if e_emerg else e_prio
+
+                # Slot label: show position if overbooked
+                slot_label = f"{e_slot}" if e_pos <= 1 else f"{e_slot}.{e_pos}"
+
+                # ── Table row ──
+                row = st.columns([0.6, 1.2, 2, 1, 1.3, 1.2, 2.5])
+                row[0].write(slot_label)
+                row[1].write(e_time)
+                row[2].write(f"**{e_name}**")
+                row[3].write(e_phone[:10] if e_phone else "—")
+                row[4].write(f"{icon} {status_label}")
+                row[5].write(prio_label)
+
+                # ── Actions column ──
+                is_active_session = can_act_today or can_add_patient
+                is_done = e_status in ("completed", "no_show", "cancelled")
+
+                if not is_active_session or is_done:
+                    row[6].write("—")
+                elif e_status == "in_progress":
+                    ac1, ac2 = row[6].columns(2)
+                    if ac1.button("✅ Done", key=f"comp_{i}", type="primary"):
                         try:
-                            r = api.call_patient({"appointment_id": e_appt_id})
-                            st.session_state["dd_msg"] = f"✅ {e_name} called in!"
+                            api.complete_appointment({"appointment_id": e_appt_id})
+                            delay = _calc_and_update_delay(sid, s_start, dur, e_slot)
+                            msg = f"✅ {e_name} visit completed."
+                            if delay and delay > 0:
+                                msg += f" Running {delay}min late."
+                            elif delay == 0:
+                                msg += " On schedule!"
+                            st.session_state["dd_msg"] = msg
                             st.rerun()
                         except Exception as ex:
-                            st.session_state["dd_msg"] = f"❌ Call failed: {ex}"
+                            st.session_state["dd_msg"] = f"❌ Complete failed: {ex}"
                             st.rerun()
-                    if ac2.button("⚡", key=f"prio_{i}", help="Set priority"):
+                    waiting_for_next = [e for e in all_q if e["status"] == "checked_in" and e["appointment_id"] != e_appt_id]
+                    if not waiting_for_next:
+                        ac2.button("➡️ Next", key=f"compnx_{i}", disabled=True, help="No patients waiting")
+                    elif ac2.button("➡️ Next", key=f"compnx_{i}", help="Complete & call next"):
+                        try:
+                            api.complete_appointment({"appointment_id": e_appt_id})
+                            delay = _calc_and_update_delay(sid, s_start, dur, e_slot)
+                            api.call_patient({"appointment_id": waiting_for_next[0]["appointment_id"]})
+                            nxt_name = waiting_for_next[0].get("patient_name", "Next patient")
+                            msg = f"✅ {e_name} completed. {nxt_name} called in!"
+                            if delay and delay > 0:
+                                msg += f" Running {delay}min late."
+                            elif delay == 0:
+                                msg += " On schedule!"
+                            st.session_state["dd_msg"] = msg
+                            st.rerun()
+                        except Exception as ex:
+                            st.session_state["dd_msg"] = f"❌ Error: {ex}"
+                            st.rerun()
+                elif e_status == "checked_in":
+                    has_in_progress = current_pat is not None
+                    if has_in_progress:
+                        ac1, ac2, ac3 = row[6].columns(3)
+                        if ac1.button("⚡", key=f"prio_{i}", help="Change priority"):
+                            st.session_state[f"show_prio_{i}"] = not st.session_state.get(f"show_prio_{i}", False)
+                            st.rerun()
+                        if ac2.button("❌", key=f"canc_{i}", help="Cancel appointment"):
+                            st.session_state[f"show_cancel_{i}"] = not st.session_state.get(f"show_cancel_{i}", False)
+                            st.rerun()
+                        if ac3.button("🚫", key=f"ns_{i}", help="No-show"):
+                            if _mark_noshow(e_appt_id):
+                                st.session_state["dd_msg"] = f"✅ {e_name} marked no-show."
+                                st.rerun()
+                            else:
+                                st.session_state["dd_msg"] = f"❌ Could not mark no-show"
+                                st.rerun()
+                    else:
+                        ac1, ac2, ac3, ac4 = row[6].columns(4)
+                        if ac1.button("📞", key=f"call_{i}", help="Call in"):
+                            try:
+                                api.call_patient({"appointment_id": e_appt_id})
+                                st.session_state["dd_msg"] = f"✅ {e_name} called in!"
+                                st.rerun()
+                            except Exception as ex:
+                                st.session_state["dd_msg"] = f"❌ Call failed: {ex}"
+                                st.rerun()
+                        if ac2.button("⚡", key=f"prio_{i}", help="Change priority"):
+                            st.session_state[f"show_prio_{i}"] = not st.session_state.get(f"show_prio_{i}", False)
+                            st.rerun()
+                        if ac3.button("❌", key=f"canc_{i}", help="Cancel"):
+                            st.session_state[f"show_cancel_{i}"] = not st.session_state.get(f"show_cancel_{i}", False)
+                            st.rerun()
+                        if ac4.button("🚫", key=f"ns_{i}", help="No-show"):
+                            if _mark_noshow(e_appt_id):
+                                st.session_state["dd_msg"] = f"✅ {e_name} marked no-show."
+                                st.rerun()
+                            else:
+                                st.session_state["dd_msg"] = f"❌ Could not mark no-show"
+                                st.rerun()
+                elif e_status == "booked":
+                    ac1, ac2, ac3 = row[6].columns(3)
+                    if ac1.button("⚡", key=f"prio_{i}", help="Change priority"):
                         st.session_state[f"show_prio_{i}"] = not st.session_state.get(f"show_prio_{i}", False)
-                    if ac3.button("🚫", key=f"ns_{i}", help="No-show"):
+                        st.rerun()
+                    if ac2.button("❌", key=f"canc_{i}", help="Cancel appointment"):
+                        st.session_state[f"show_cancel_{i}"] = not st.session_state.get(f"show_cancel_{i}", False)
+                        st.rerun()
+                    if ac3.button("🚫", key=f"bns_{i}", help="No-show"):
                         if _mark_noshow(e_appt_id):
                             st.session_state["dd_msg"] = f"✅ {e_name} marked no-show."
                             st.rerun()
                         else:
                             st.session_state["dd_msg"] = f"❌ Could not mark no-show"
                             st.rerun()
-            elif e_status == "in_progress":
-                ic1, ic2 = row[6].columns(2)
-                if ic1.button("✅ Done", key=f"comp_{i}", type="primary"):
-                    try:
-                        api.complete_appointment({"appointment_id": e_appt_id})
-                        delay = _calc_and_update_delay(sid, s_start, dur, e_slot)
-                        msg = f"✅ {e_name} visit completed."
-                        if delay and delay > 0:
-                            msg += f" Running {delay}min late."
-                        elif delay == 0:
-                            msg += " On schedule!"
-                        st.session_state["dd_msg"] = msg
-                        st.rerun()
-                    except Exception as ex:
-                        st.session_state["dd_msg"] = f"❌ Complete failed: {ex}"
-                        st.rerun()
-                waiting_for_next = [e for e in all_q if e["status"] == "checked_in" and e["appointment_id"] != e_appt_id]
-                if not waiting_for_next:
-                    ic2.button("✅➡️ Next", key=f"compnx_{i}", disabled=True, help="No patients waiting")
-                elif ic2.button("✅➡️ Next", key=f"compnx_{i}", help="Complete & call next"):
-                    try:
-                        api.complete_appointment({"appointment_id": e_appt_id})
-                        delay = _calc_and_update_delay(sid, s_start, dur, e_slot)
-                        api.call_patient({"appointment_id": waiting_for_next[0]["appointment_id"]})
-                        nxt_name = waiting_for_next[0].get("patient_name", "Next patient")
-                        msg = f"✅ {e_name} completed. {nxt_name} called in!"
-                        if delay and delay > 0:
-                            msg += f" Running {delay}min late."
-                        elif delay == 0:
-                            msg += " On schedule!"
-                        st.session_state["dd_msg"] = msg
-                        st.rerun()
-                    except Exception as ex:
-                        st.session_state["dd_msg"] = f"❌ Error: {ex}"
-                        st.rerun()
-            elif e_status == "booked":
-                bc1, bc2 = row[6].columns(2)
-                bc1.caption("Awaiting check-in")
-                if bc2.button("🚫 No-show", key=f"bns_{i}", help="Mark as no-show"):
-                    if _mark_noshow(e_appt_id):
-                        st.rerun()
-                    else:
-                        st.error("Could not mark no-show")
-            else:
-                row[6].write("—")
+                else:
+                    row[6].write("—")
 
-            # Priority edit (expanded inline when toggled)
-            if can_act and st.session_state.get(f"show_prio_{i}", False) and e_status == "checked_in":
-                with st.container():
-                    with st.form(f"prioform_{i}", clear_on_submit=True):
-                        pc1, pc2, pc3, pc4 = st.columns([1.5, 1, 2, 1])
-                        tier_opts = ["NORMAL", "HIGH", "CRITICAL"]
-                        cur_idx = tier_opts.index(e_prio) if e_prio in tier_opts else 0
-                        new_tier = pc1.selectbox("Tier", tier_opts, index=cur_idx, key=f"pt_{i}")
-                        new_emerg = pc2.checkbox("Emergency", value=e_emerg, key=f"em_{i}")
-                        esc_reason = pc3.text_input("Reason", key=f"er_{i}")
-                        if pc4.form_submit_button("Save"):
+                # ── Priority edit (expanded inline when toggled) ──
+                if is_active_session and st.session_state.get(f"show_prio_{i}", False) and e_status in ("checked_in", "booked"):
+                    with st.container():
+                        with st.form(f"prioform_{i}", clear_on_submit=True):
+                            pc1, pc2, pc3, pc4 = st.columns([1.5, 1, 2, 1])
+                            tier_opts = ["NORMAL", "HIGH", "CRITICAL"]
+                            cur_idx = tier_opts.index(e_prio) if e_prio in tier_opts else 0
+                            new_tier = pc1.selectbox("Tier", tier_opts, index=cur_idx, key=f"pt_{i}")
+                            new_emerg = pc2.checkbox("Emergency", value=e_emerg, key=f"em_{i}")
+                            esc_reason = pc3.text_input("Reason", key=f"er_{i}")
+                            if pc4.form_submit_button("Save"):
+                                try:
+                                    api.escalate_priority({
+                                        "appointment_id": e_appt_id,
+                                        "priority_tier": new_tier,
+                                        "is_emergency": new_emerg,
+                                        "reason": esc_reason or "Updated by doctor",
+                                    })
+                                    st.session_state[f"show_prio_{i}"] = False
+                                    st.session_state["dd_msg"] = f"✅ Priority updated for {e_name}."
+                                    st.rerun()
+                                except Exception as ex:
+                                    st.error(f"{ex}")
+
+                # ── Cancel confirmation (expanded inline when toggled) ──
+                if is_active_session and st.session_state.get(f"show_cancel_{i}", False) and e_status in ("checked_in", "booked"):
+                    with st.container():
+                        st.warning(f"Cancel appointment for **{e_name}** (Slot {slot_label} at {e_time})?")
+                        cc1, cc2, cc3 = st.columns([2, 1, 1])
+                        cancel_reason = cc1.text_input("Reason", key=f"cr_{i}", placeholder="e.g. Patient request, Emergency reschedule")
+                        if cc2.button("Confirm Cancel", key=f"cc_{i}", type="primary"):
                             try:
-                                api.escalate_priority({
+                                api.staff_cancel_appointment({
                                     "appointment_id": e_appt_id,
-                                    "priority_tier": new_tier,
-                                    "is_emergency": new_emerg,
-                                    "reason": esc_reason or "Updated by doctor",
+                                    "reason": cancel_reason or "Cancelled by doctor",
                                 })
-                                st.session_state[f"show_prio_{i}"] = False
+                                st.session_state[f"show_cancel_{i}"] = False
+                                st.session_state["dd_msg"] = f"✅ {e_name}'s appointment cancelled."
                                 st.rerun()
                             except Exception as ex:
-                                st.error(f"{ex}")
+                                st.session_state["dd_msg"] = f"❌ Cancel failed: {ex}"
+                                st.rerun()
+                        if cc3.button("Keep", key=f"ck_{i}"):
+                            st.session_state[f"show_cancel_{i}"] = False
+                            st.rerun()
 
 
 def _show_patient_detail(entry):
@@ -2340,35 +2461,50 @@ def page_doctor_session():
                 except Exception as e:
                     st.error(f"{e}")
 
+    # Determine if this is an afternoon session (start >= 14:00)
+    _sess_is_afternoon = False
+    for _ms in my_sessions:
+        if _ms["session_id"] == sid:
+            try:
+                _sess_is_afternoon = int(str(_ms["start_time"])[:2]) >= 14
+            except Exception:
+                pass
+            break
+
     st.divider()
-    c3, c4 = st.columns(2)
-    with c3:
-        st.subheader("Overtime Check")
-        st.caption("See how many patients you can still see if you stay extra.")
-        with st.form("ot_form"):
-            ot = st.number_input("Extra minutes you can stay", min_value=0, max_value=60, value=15)
-            if st.form_submit_button("Check"):
-                try:
-                    r = api.overtime_window({"session_id": sid, "overtime_minutes": ot})
-                    st.info(r["message"])
-                    for p in r.get("patients_can_be_seen", []):
-                        st.write(f"  ✅ {(p.get('patient_name') or '?')} — Slot {p['slot_number']}")
-                    for p in r.get("patients_cannot_be_seen", []):
-                        st.write(f"  ❌ {(p.get('patient_name') or '?')} — Slot {p['slot_number']} (will be notified)")
-                except Exception as e:
-                    st.error(f"{e}")
-    with c4:
-        st.subheader("Extend Session")
-        st.caption("Officially extend your session end time to see more patients.")
-        with st.form("extend_form"):
-            new_end = st.time_input("New end time")
-            note = st.text_input("Reason")
-            if st.form_submit_button("Extend"):
-                try:
-                    r = api.extend_session({"session_id": sid, "new_end_time": str(new_end), "note": note})
-                    st.success(r["message"])
-                except Exception as e:
-                    st.error(f"{e}")
+    if _sess_is_afternoon:
+        c3, c4 = st.columns(2)
+        with c3:
+            st.subheader("Overtime Check")
+            st.caption("See how many patients you can still see if you stay extra.")
+            with st.form("ot_form"):
+                ot = st.number_input("Extra minutes you can stay", min_value=0, max_value=60, value=15)
+                if st.form_submit_button("Check"):
+                    try:
+                        r = api.overtime_window({"session_id": sid, "overtime_minutes": ot})
+                        st.info(r["message"])
+                        for p in r.get("patients_can_be_seen", []):
+                            st.write(f"  ✅ {(p.get('patient_name') or '?')} — Slot {p['slot_number']}")
+                        for p in r.get("patients_cannot_be_seen", []):
+                            st.write(f"  ❌ {(p.get('patient_name') or '?')} — Slot {p['slot_number']} (will be notified)")
+                    except Exception as e:
+                        st.error(f"{e}")
+        with c4:
+            st.subheader("Extend Session")
+            st.caption("Officially extend your session end time to see more patients.")
+            with st.form("extend_form"):
+                new_end = st.time_input("New end time")
+                note = st.text_input("Reason")
+                if st.form_submit_button("Extend"):
+                    try:
+                        r = api.extend_session({"session_id": sid, "new_end_time": str(new_end), "note": note})
+                        st.toast(r.get('message', 'Session extended!'), icon="✅")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"{e}")
+    else:
+        st.info("☀️ **Morning session** — Extend/Overtime not available. "
+                "Pending patients will automatically carry over to the afternoon session when you complete this one.")
 
 
 # ════════════════════════════════════════════════════════════
@@ -2426,7 +2562,9 @@ def page_staff_session():
     # ── Gather all patients ──
     all_entries = q.get("queue", [])
     current_patient = q.get("current_patient")
-    waiting = [e for e in all_entries if e["status"] == "checked_in"]
+    # Separate emergency (slot_number=0) from normal queue
+    waiting = [e for e in all_entries if e["status"] == "checked_in" and not e.get("is_emergency")]
+    emergency_waiting = [e for e in all_entries if e["status"] == "checked_in" and e.get("is_emergency")]
     not_arrived = [e for e in all_entries if e["status"] == "booked"]
     completed_entries = [e for e in all_entries if e["status"] == "completed"]
     noshow_entries = [e for e in all_entries if e["status"] == "no_show"]
@@ -2434,6 +2572,7 @@ def page_staff_session():
     all_patients = []
     if current_patient:
         all_patients.append(current_patient)
+    all_patients.extend(emergency_waiting)
     all_patients.extend(waiting)
     all_patients.extend(not_arrived)
     all_patients.extend(completed_entries)
@@ -2458,16 +2597,23 @@ def page_staff_session():
     # ── Status summary (colored pills) ──
     n_booked = len(not_arrived)
     n_waiting = len(waiting)
+    n_emergency = len(emergency_waiting)
     n_ip = 1 if current_patient else 0
     n_done = len(completed_entries)
     n_noshow = len(noshow_entries)
-    total_p = n_booked + n_waiting + n_ip + n_done + n_noshow
+    total_p = n_booked + n_waiting + n_emergency + n_ip + n_done + n_noshow
     progress = (n_done / total_p * 100) if total_p > 0 else 0
+
+    emg_pill = ""
+    if n_emergency > 0:
+        emg_pill = (f'<div style="background:#dc262620;border:1px solid #dc262650;border-radius:20px;padding:4px 14px;font-size:0.85em">'
+                    f'🚨 <strong>{n_emergency}</strong> Emergency</div>')
 
     summary_html = (
         '<div style="display:flex;gap:6px;margin:6px 0 12px 0;flex-wrap:wrap;align-items:center">'
         f'<div style="background:#3b82f620;border:1px solid #3b82f650;border-radius:20px;padding:4px 14px;font-size:0.85em">'
         f'📅 <strong>{n_booked}</strong> Booked</div>'
+        f'{emg_pill}'
         f'<div style="background:#f59e0b20;border:1px solid #f59e0b50;border-radius:20px;padding:4px 14px;font-size:0.85em">'
         f'✅ <strong>{n_waiting}</strong> Waiting</div>'
         f'<div style="background:#8b5cf620;border:1px solid #8b5cf650;border-radius:20px;padding:4px 14px;font-size:0.85em">'
@@ -2490,13 +2636,14 @@ def page_staff_session():
     )
 
     # ── Quick action bar ──
-    qa1, qa2, qa3 = st.columns(3)
-    # Call Next
+    qa1, qa2, qa3, qa4 = st.columns(4)
+
+    # Call Next (normal queue)
     if not is_future and not current_patient and waiting:
         next_name = (waiting[0].get("patient_name") or "Next Patient")
         if qa1.button(f"🔔 Call {next_name}", type="primary", use_container_width=True, key="call_next_top"):
             try:
-                r = api.call_next({"session_id": session_id})
+                r = api.call_patient({"appointment_id": waiting[0]["appointment_id"]})
                 st.success(r["message"])
                 st.rerun()
             except Exception as e:
@@ -2504,9 +2651,22 @@ def page_staff_session():
     elif current_patient:
         qa1.info(f"🔄 {(current_patient.get('patient_name') or 'Patient')} is with doctor")
 
+    # Call Emergency patient
+    if not is_future and not current_patient and emergency_waiting:
+        emg_name = (emergency_waiting[0].get("patient_name") or "Emergency")
+        if qa2.button(f"🚨 Call {emg_name}", type="primary", use_container_width=True, key="call_emg_top"):
+            try:
+                r = api.call_patient({"appointment_id": emergency_waiting[0]["appointment_id"]})
+                st.success(r["message"])
+                st.rerun()
+            except Exception as e:
+                st.error(f"{e}")
+    elif not is_future and emergency_waiting and current_patient:
+        qa2.warning(f"🚨 {len(emergency_waiting)} emergency waiting")
+
     # Mark no-shows (for past/today when booked patients remain)
     if not_arrived and not is_future:
-        if qa2.button("⚠️ Mark Unarrived No-Show", use_container_width=True, key="bulk_noshow"):
+        if qa3.button("⚠️ Mark Unarrived No-Show", use_container_width=True, key="bulk_noshow"):
             try:
                 r = api.mark_no_shows({"session_id": session_id})
                 st.success(r["message"])
@@ -2516,7 +2676,7 @@ def page_staff_session():
 
     # Add patient — separate section below patient list
     if not is_past:
-        if qa3.button("➕ Add Patient", use_container_width=True, key="add_patient_toggle"):
+        if qa4.button("➕ Add Patient", use_container_width=True, key="add_patient_toggle"):
             st.session_state["show_add_patient"] = not st.session_state.get("show_add_patient", False)
 
     st.divider()
@@ -2531,6 +2691,9 @@ def page_staff_session():
     # Helper: slot time string
     def _slot_time_str(entry):
         """Get slot time as HH:MM. Falls back to calculating from session start + slot number."""
+        # Emergency patients (slot_number=0) have no scheduled time
+        if entry.get("is_emergency") or entry.get("slot_number", 1) == 0:
+            return "🚨 Emergency"
         t = entry.get("original_slot_time", "")
         if t:
             return str(t)[:5]
@@ -2870,19 +3033,34 @@ def page_staff_session():
                                 except Exception as e:
                                     st.error(f"Failed: {e}")
 
-                    bc1, bc2, bc3 = st.columns(3)
-                    if not current_patient:
-                        if bc1.button("🔔 Call to Doctor", key=f"btn_call_{appt_id}", type="primary", use_container_width=True):
-                            st.session_state[action_key] = "call"
+                    if entry.get("is_emergency"):
+                        bc1, bc2, bc3 = st.columns(3)
+                        if not current_patient:
+                            if bc1.button("🔔 Call to Doctor", key=f"btn_call_{appt_id}", type="primary", use_container_width=True):
+                                st.session_state[action_key] = "call"
+                                st.rerun()
+                        else:
+                            bc1.info("🔄 Complete current patient first")
+                        if bc2.button("✖ Cancel", key=f"btn_cx_{appt_id}", use_container_width=True):
+                            st.session_state[action_key] = "cancel"
+                            st.rerun()
+                        if bc3.button("🔀 Reassign", key=f"btn_ra_{appt_id}", use_container_width=True):
+                            st.session_state[f"reassign_{appt_id}"] = True
                             st.rerun()
                     else:
-                        bc1.info("🔄 Complete current patient first")
-                    if bc2.button("↩ Undo Check-in", key=f"btn_uci_{appt_id}", use_container_width=True):
-                        st.session_state[action_key] = "undo_checkin"
-                        st.rerun()
-                    if bc3.button("🔀 Reassign", key=f"btn_ra_{appt_id}", use_container_width=True):
-                        st.session_state[f"reassign_{appt_id}"] = True
-                        st.rerun()
+                        bc1, bc2, bc3 = st.columns(3)
+                        if not current_patient:
+                            if bc1.button("🔔 Call to Doctor", key=f"btn_call_{appt_id}", type="primary", use_container_width=True):
+                                st.session_state[action_key] = "call"
+                                st.rerun()
+                        else:
+                            bc1.info("🔄 Complete current patient first")
+                        if bc2.button("↩ Undo Check-in", key=f"btn_uci_{appt_id}", use_container_width=True):
+                            st.session_state[action_key] = "undo_checkin"
+                            st.rerun()
+                        if bc3.button("🔀 Reassign", key=f"btn_ra_{appt_id}", use_container_width=True):
+                            st.session_state[f"reassign_{appt_id}"] = True
+                            st.rerun()
 
                 elif is_past:
                     st.markdown(
@@ -3023,33 +3201,45 @@ def page_staff_session():
                             st.error(f"{e}")
 
             with dc2:
-                st.subheader("Overtime Check")
-                st.caption("If running late, check who can still be seen if doctor stays extra.")
-                with st.form("staff_ot_form"):
-                    ot = st.number_input("Extra minutes available", min_value=0, max_value=60, value=15)
-                    if st.form_submit_button("Check"):
-                        try:
-                            r = api.overtime_window({"session_id": session_id, "overtime_minutes": ot})
-                            st.info(r["message"])
-                            for p in r.get("patients_can_be_seen", []):
-                                st.write(f"  ✅ {(p.get('patient_name') or '?')} — can be seen")
-                            for p in r.get("patients_cannot_be_seen", []):
-                                st.write(f"  ❌ {(p.get('patient_name') or '?')} — needs reschedule")
-                        except Exception as e:
-                            st.error(f"{e}")
+                # Only show overtime/extend for afternoon sessions (start >= 14:00)
+                _staff_is_afternoon = False
+                try:
+                    _staff_is_afternoon = int(str(session_start)[:2]) >= 14
+                except Exception:
+                    pass
 
-                st.divider()
-                st.subheader("Extend Session")
-                st.caption("Extend the session end time to accommodate more patients.")
-                with st.form("staff_extend_form"):
-                    new_end = st.time_input("New end time")
-                    note = st.text_input("Reason")
-                    if st.form_submit_button("Extend"):
-                        try:
-                            r = api.extend_session({"session_id": session_id, "new_end_time": str(new_end), "note": note})
-                            st.success(r["message"])
-                        except Exception as e:
-                            st.error(f"{e}")
+                if _staff_is_afternoon:
+                    st.subheader("Overtime Check")
+                    st.caption("If running late, check who can still be seen if doctor stays extra.")
+                    with st.form("staff_ot_form"):
+                        ot = st.number_input("Extra minutes available", min_value=0, max_value=60, value=15)
+                        if st.form_submit_button("Check"):
+                            try:
+                                r = api.overtime_window({"session_id": session_id, "overtime_minutes": ot})
+                                st.info(r["message"])
+                                for p in r.get("patients_can_be_seen", []):
+                                    st.write(f"  ✅ {(p.get('patient_name') or '?')} — can be seen")
+                                for p in r.get("patients_cannot_be_seen", []):
+                                    st.write(f"  ❌ {(p.get('patient_name') or '?')} — needs reschedule")
+                            except Exception as e:
+                                st.error(f"{e}")
+
+                    st.divider()
+                    st.subheader("Extend Session")
+                    st.caption("Extend the session end time to accommodate more patients.")
+                    with st.form("staff_extend_form"):
+                        new_end = st.time_input("New end time")
+                        note = st.text_input("Reason")
+                        if st.form_submit_button("Extend"):
+                            try:
+                                r = api.extend_session({"session_id": session_id, "new_end_time": str(new_end), "note": note})
+                                st.toast(r.get('message', 'Session extended!'), icon="✅")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"{e}")
+                else:
+                    st.info("☀️ **Morning session** — Extend/Overtime not available. "
+                            "Pending patients will automatically carry over to the afternoon session.")
 
     # ══════════════════════════════════════════════════════
     # ADD PATIENT — full booking form (Department → Doctor → Time)
@@ -3371,15 +3561,48 @@ def page_nurse_emergency():
         st.rerun()
     st.warning("Bypasses rate limits & risk scores. Only for real emergencies.")
 
+    # Show success/error from previous action
+    if st.session_state.get("emg_msg"):
+        st.success(st.session_state.pop("emg_msg"))
+
     session_id = _smart_session_picker("emg_sp")
     if not session_id:
         return
 
-    # Get session info for slot count
+    st.info("Emergency patients are added directly to the queue **without a time slot**. "
+            "The doctor can call them at any time, bypassing the normal queue order.")
+
+    # ── Show current emergency patients in this session with cancel option ──
+    try:
+        _emg_q = api.get_queue(session_id)
+        _emg_entries = [e for e in _emg_q.get("queue", [])
+                        if e.get("is_emergency") and e["status"] not in ("cancelled", "no_show", "completed")]
+        if _emg_entries:
+            st.markdown(f"### 🚨 Current Emergency Patients ({len(_emg_entries)})")
+            for _ei, _ee in enumerate(_emg_entries):
+                _ec1, _ec2, _ec3 = st.columns([4, 2, 1])
+                _ee_name = _ee.get("patient_name") or "Patient"
+                _ee_status = _ee.get("status", "")
+                _ee_prio = _ee.get("priority_tier", "CRITICAL")
+                _status_badge = {"checked_in": "⏳ Waiting", "in_progress": "🔄 With Doctor", "booked": "📅 Booked"}.get(_ee_status, _ee_status)
+                _ec1.write(f"**{_ee_name}**  •  {_ee_prio}  •  {_status_badge}")
+                _ec2.caption(f"Slot pos: {_ee.get('slot_position', '—')}")
+                if _ee_status in ("checked_in", "booked"):
+                    if _ec3.button("✖ Cancel", key=f"emg_cx_{_ei}", use_container_width=True):
+                        try:
+                            api.staff_cancel_appointment({"appointment_id": _ee["appointment_id"],
+                                                          "reason": "Cancelled from emergency page"})
+                            st.session_state["emg_msg"] = f"Cancelled emergency entry for {_ee_name}"
+                            st.rerun()
+                        except Exception as _ex:
+                            st.error(f"Cancel failed: {_ex}")
+            st.divider()
+    except Exception:
+        pass  # non-critical — don't block the booking form
+
+    # Get patients from queue for easy pick
     try:
         q = api.get_queue(session_id)
-        total_slots = 20  # fallback
-        # Get patients from queue for easy pick
         known = []
         seen = set()
         for e in q.get("queue", []):
@@ -3387,33 +3610,91 @@ def page_nurse_emergency():
                 seen.add(e["patient_id"])
                 known.append({"id": e["patient_id"], "label": e.get('patient_name') or e['patient_id'][:8]})
     except Exception:
-        total_slots = 20
         known = []
 
-    mode = st.radio("Find patient", ["Pick from known patients", "Enter Patient ID"], horizontal=True)
+    mode = st.radio("Find patient", ["Search by name", "Pick from known patients", "Enter Patient ID", "New walk-in patient"], horizontal=True, key="emg_mode")
     patient_id = None
-    if mode == "Pick from known patients" and known:
-        p_labels = [p["label"] for p in known]
-        p_idx = st.selectbox("Patient", range(len(p_labels)), format_func=lambda i: p_labels[i])
-        patient_id = known[p_idx]["id"]
-    else:
+    _emg_new_walkin = False
+    if mode == "Search by name":
+        search_q = st.text_input("Search patient name or phone", key="emg_search")
+        if search_q and len(search_q) >= 2:
+            try:
+                results = api.search_patients(search_q)
+                if results:
+                    sr_labels = [f"{r['full_name']} — {r.get('phone', '')}" for r in results]
+                    sr_idx = st.selectbox("Select patient", range(len(sr_labels)),
+                                           format_func=lambda i: sr_labels[i], key="emg_sr")
+                    patient_id = results[sr_idx]["patient_id"]
+                else:
+                    st.info("No patients found. Use **New walk-in patient** to register.")
+            except Exception:
+                st.warning("Search failed.")
+    elif mode == "Pick from known patients":
+        if known:
+            p_labels = [p["label"] for p in known]
+            p_idx = st.selectbox("Patient", range(len(p_labels)), format_func=lambda i: p_labels[i])
+            patient_id = known[p_idx]["id"]
+        else:
+            st.info("No patients in current session queue.")
+    elif mode == "Enter Patient ID":
         patient_id = st.text_input("Patient ID")
+    else:
+        # New walk-in patient — quick register
+        _emg_new_walkin = True
+        st.caption("Quick-register a new patient for this emergency.")
+        _emg_wc1, _emg_wc2 = st.columns(2)
+        _emg_walk_name = _emg_wc1.text_input("Full Name *", key="emg_walk_name")
+        _emg_walk_phone = _emg_wc2.text_input("Phone (optional)", key="emg_walk_phone")
 
-    slot_number = st.number_input("Slot Number", min_value=1, max_value=total_slots, value=1)
+    priority = st.selectbox("Priority Level", ["CRITICAL", "HIGH", "NORMAL"], key="emg_priority")
     reason = st.text_area("Emergency Reason (required)")
 
-    if st.button("⚡ Force Book Emergency Slot", type="primary", use_container_width=True):
-        if not patient_id:
+    # Prevent double-submit: track if we already submitted
+    _emg_submitted_key = "emg_submitted"
+    if st.button("⚡ Add Emergency Patient", type="primary", use_container_width=True,
+                  disabled=st.session_state.get(_emg_submitted_key, False)):
+        if _emg_new_walkin:
+            if not _emg_walk_name or len(_emg_walk_name.strip()) < 2:
+                st.error("Enter a name for the patient.")
+            elif not reason or len(reason) < 5:
+                st.error("Reason must be at least 5 characters.")
+            else:
+                st.session_state[_emg_submitted_key] = True
+                try:
+                    reg = api.quick_register_patient({"full_name": _emg_walk_name.strip(),
+                                                       "phone": _emg_walk_phone.strip() if _emg_walk_phone else None})
+                    patient_id = reg.get("patient_id")
+                    if not patient_id:
+                        st.error("Registration failed — no patient ID returned.")
+                        st.session_state[_emg_submitted_key] = False
+                    else:
+                        r = api.emergency_book({"session_id": session_id,
+                                                 "patient_id": patient_id,
+                                                 "reason": reason,
+                                                 "priority_tier": priority})
+                        st.session_state["emg_msg"] = f"✅ Registered & added: {r['message']}"
+                        st.session_state[_emg_submitted_key] = False
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+                    st.session_state[_emg_submitted_key] = False
+        elif not patient_id:
             st.error("Select a patient first.")
         elif not reason or len(reason) < 5:
             st.error("Reason must be at least 5 characters.")
         else:
+            st.session_state[_emg_submitted_key] = True
             try:
-                r = api.emergency_book({"session_id": session_id, "slot_number": slot_number,
-                                         "patient_id": patient_id, "reason": reason})
-                st.success(f"✅ {r['message']}")
+                r = api.emergency_book({"session_id": session_id,
+                                         "patient_id": patient_id,
+                                         "reason": reason,
+                                         "priority_tier": priority})
+                st.session_state["emg_msg"] = f"✅ {r['message']}"
+                st.session_state[_emg_submitted_key] = False
+                st.rerun()
             except Exception as e:
                 st.error(f"Failed: {e}")
+                st.session_state[_emg_submitted_key] = False
 
 
 # ════════════════════════════════════════════════════════════
@@ -3505,11 +3786,87 @@ def page_nurse_patients():
             # ── Family members ──
             rels = detail.get("relationships", [])
             if rels:
-                st.markdown("**👨‍👩‍👧‍👦 Family Members**")
-                for r in rels:
-                    rc1, rc2 = st.columns([3, 2])
-                    rc1.write(f"**{r.get('beneficiary_name', '—')}**")
-                    rc2.write(f"{(r.get('relationship_type') or '—').title()}")
+                st.markdown("**👨‍👩‍👧‍👦 Family Members / Beneficiaries**")
+                for nri, r in enumerate(rels):
+                    nb_pid = r.get("beneficiary_patient_id", "")
+                    nb_name = r.get("beneficiary_name", "—")
+                    nb_rel = (r.get("relationship_type") or "—").title()
+                    rc1, rc2, rc3 = st.columns([3, 2, 1])
+                    rc1.write(f"**{nb_name}**")
+                    rc2.write(f"{nb_rel}")
+                    if nb_pid:
+                        with rc3.popover("👁️ View / Edit", use_container_width=True):
+                            try:
+                                nb_detail = api.admin_get_patient(nb_pid)
+                                st.markdown(f"### {nb_detail.get('full_name', nb_name)}")
+                                nbd1, nbd2 = st.columns(2)
+                                with nbd1:
+                                    st.write(f"**Email:** {nb_detail.get('email') or '—'}")
+                                    st.write(f"**Phone:** {nb_detail.get('phone') or '—'}")
+                                    st.write(f"**Gender:** {(nb_detail.get('gender') or '—').title()}")
+                                    st.write(f"**DOB:** {nb_detail.get('date_of_birth') or '—'}")
+                                    st.write(f"**Blood Group:** {nb_detail.get('blood_group') or '—'}")
+                                with nbd2:
+                                    st.write(f"**ABHA/UHID:** {nb_detail.get('abha_id') or '—'}")
+                                    st.write(f"**Address:** {nb_detail.get('address') or '—'}")
+                                    st.write(f"**Emergency:** {nb_detail.get('emergency_contact_name') or '—'}")
+                                    st.write(f"**Emergency Ph:** {nb_detail.get('emergency_contact_phone') or '—'}")
+                                    nb_risk = float(nb_detail.get('risk_score') or 0)
+                                    nb_risk_dot = "🟢" if nb_risk < 3 else "🟡" if nb_risk < 7 else "🔴"
+                                    st.write(f"**Risk:** {nb_risk_dot} {nb_risk:.1f}")
+                                # Appointments
+                                nb_appts = nb_detail.get("appointments", [])
+                                if nb_appts:
+                                    st.markdown(f"**Recent Appointments** ({len(nb_appts)})")
+                                    for nba in nb_appts[:5]:
+                                        nba_s = nba.get("status", "—")
+                                        nba_icon = {"booked": "📅", "checked_in": "✅", "completed": "✔️",
+                                                     "no_show": "⚠️", "cancelled": "❌"}.get(nba_s, "•")
+                                        st.write(f"{nba_icon} {nba.get('session_date', '')} — "
+                                                 f"Dr. {nba.get('doctor_name', '—')} ({nba.get('specialization', '')}) — "
+                                                 f"{nba.get('slot_time', '')} — {nba_s}")
+                                else:
+                                    st.info("No appointments yet.")
+                                # ── Edit beneficiary profile ──
+                                st.divider()
+                                st.markdown("**✏️ Edit Profile**")
+                                nbe_name = st.text_input("Full Name", value=nb_detail.get("full_name") or nb_name, key=f"nbe_fn_{pid}_{nri}")
+                                nbe_email = st.text_input("Email", value=nb_detail.get("email") or "", key=f"nbe_em_{pid}_{nri}")
+                                nbe_phone = st.text_input("Phone", value=nb_detail.get("phone") or "", key=f"nbe_ph_{pid}_{nri}")
+                                _nbe_g_opts = ["", "Male", "Female", "Other"]
+                                _nbe_cur_g = nb_detail.get("gender") or ""
+                                _nbe_gi = _nbe_g_opts.index(_nbe_cur_g) if _nbe_cur_g in _nbe_g_opts else 0
+                                nbe_gender = st.selectbox("Gender", _nbe_g_opts, index=_nbe_gi, key=f"nbe_gn_{pid}_{nri}")
+                                nbe_blood = st.selectbox("Blood Group",
+                                                          ["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"],
+                                                          index=["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"].index(nb_detail.get("blood_group") or ""),
+                                                          key=f"nbe_bg_{pid}_{nri}")
+                                nbe_abha = st.text_input("ABHA/UHID", value=nb_detail.get("abha_id") or "", key=f"nbe_abha_{pid}_{nri}")
+                                nbe_addr = st.text_area("Address", value=nb_detail.get("address") or "", key=f"nbe_addr_{pid}_{nri}")
+                                nbe_ec_name = st.text_input("Emergency Name", value=nb_detail.get("emergency_contact_name") or "", key=f"nbe_ecn_{pid}_{nri}")
+                                nbe_ec_phone = st.text_input("Emergency Phone", value=nb_detail.get("emergency_contact_phone") or "", key=f"nbe_ecp_{pid}_{nri}")
+                                if st.button("💾 Save Changes", key=f"nbe_save_{pid}_{nri}", type="primary", use_container_width=True):
+                                    nb_payload = {}
+                                    if nbe_name and nbe_name != (nb_detail.get("full_name") or nb_name): nb_payload["full_name"] = nbe_name
+                                    if nbe_email and nbe_email != (nb_detail.get("email") or ""): nb_payload["email"] = nbe_email
+                                    if nbe_phone and nbe_phone != (nb_detail.get("phone") or ""): nb_payload["phone"] = nbe_phone
+                                    if nbe_gender and nbe_gender != (nb_detail.get("gender") or ""): nb_payload["gender"] = nbe_gender
+                                    if nbe_blood and nbe_blood != (nb_detail.get("blood_group") or ""): nb_payload["blood_group"] = nbe_blood
+                                    if nbe_abha and nbe_abha != (nb_detail.get("abha_id") or ""): nb_payload["abha_id"] = nbe_abha
+                                    if nbe_addr and nbe_addr != (nb_detail.get("address") or ""): nb_payload["address"] = nbe_addr
+                                    if nbe_ec_name and nbe_ec_name != (nb_detail.get("emergency_contact_name") or ""): nb_payload["emergency_contact_name"] = nbe_ec_name
+                                    if nbe_ec_phone and nbe_ec_phone != (nb_detail.get("emergency_contact_phone") or ""): nb_payload["emergency_contact_phone"] = nbe_ec_phone
+                                    if nb_payload:
+                                        try:
+                                            api.admin_update_patient(nb_pid, nb_payload)
+                                            st.session_state["nurse_pat_msg"] = f"Profile updated for {nbe_name or nb_name}"
+                                            st.rerun()
+                                        except Exception as ex:
+                                            st.error(f"{ex}")
+                                    else:
+                                        st.info("No changes to save.")
+                            except Exception as e:
+                                st.error(f"Could not load details: {e}")
 
             # ── Appointment history (last 10) ──
             appts = detail.get("appointments", [])
@@ -3566,23 +3923,11 @@ def page_nurse_patients():
                                                 format_func=lambda i: nbk_doc_labels[i], key=f"nbk_doc_{pid}")
                     nbk_doc = nbk_docs[nbk_doc_idx]
 
-                    # ── Date picker — nurse can book for any date ──
-                    from datetime import date as _nbk_d, timedelta as _nbk_td
-                    nbk_date_opts = ["Today", "Tomorrow", "This Week", "Next Week", "Custom Date"]
-                    nbk_date_choice = st.selectbox("📅 Date Range", nbk_date_opts, key=f"nbk_date_{pid}")
+                    # ── Date picker ──
+                    from datetime import date as _nbk_d
                     _nbk_today = _nbk_d.today()
-                    if nbk_date_choice == "Today":
-                        nbk_from, nbk_to = _nbk_today, _nbk_today
-                    elif nbk_date_choice == "Tomorrow":
-                        nbk_from = nbk_to = _nbk_today + _nbk_td(days=1)
-                    elif nbk_date_choice == "This Week":
-                        nbk_from, nbk_to = _nbk_today, _nbk_today + _nbk_td(days=6)
-                    elif nbk_date_choice == "Next Week":
-                        nbk_from = _nbk_today + _nbk_td(days=7)
-                        nbk_to = _nbk_today + _nbk_td(days=13)
-                    else:
-                        nbk_from = st.date_input("From", value=_nbk_today, key=f"nbk_from_{pid}")
-                        nbk_to = st.date_input("To", value=_nbk_today + _nbk_td(days=7), key=f"nbk_to_{pid}")
+                    nbk_date = st.date_input("📅 Date", value=_nbk_today, key=f"nbk_date_{pid}")
+                    nbk_from, nbk_to = nbk_date, nbk_date
 
                     # Load ALL sessions for the date range
                     try:
@@ -3626,54 +3971,74 @@ def page_nurse_patients():
                             nbk_total = nbk_sess.get("total_slots", 1)
                             nbk_dur = nbk_sess.get("slot_duration_minutes", 15)
                             nbk_start = str(nbk_sess.get("start_time", "09:00"))
-                            nbk_slot_opts = []
+                            from datetime import datetime as _nbk_dt
+                            _nbk_now_min = _nbk_dt.now().hour * 60 + _nbk_dt.now().minute
+                            _nbk_is_today = str(nbk_date) == str(_nbk_d.today())
+                            nbk_slot_opts = []  # list of (slot_number, label)
                             for si in range(1, nbk_total + 1):
                                 try:
                                     hh, mm = int(nbk_start[:2]), int(nbk_start[3:5])
                                     t_min = hh * 60 + mm + (si - 1) * nbk_dur
+                                    if _nbk_is_today and t_min + nbk_dur <= _nbk_now_min:
+                                        continue
                                     t_str = f"{t_min // 60:02d}:{t_min % 60:02d}"
                                 except Exception:
                                     t_str = f"Slot {si}"
-                                nbk_slot_opts.append(f"Slot {si} — {t_str}")
-                            nbk_slot_idx = st.selectbox("Time Slot", range(len(nbk_slot_opts)),
-                                                         format_func=lambda i: nbk_slot_opts[i], key=f"nbk_slot_{pid}")
-                            nbk_slot_num = nbk_slot_idx + 1
-                            st.caption(f"**Patient:** {nbk_name}  •  **Doctor:** {nbk_doc['full_name']}  •  **Slot:** {nbk_slot_opts[nbk_slot_idx]}")
-                            if st.button("✅ Confirm Booking", key=f"nbk_confirm_{pid}", type="primary", use_container_width=True):
-                                try:
-                                    api.staff_book({
-                                        "session_id": nbk_sess["session_id"],
-                                        "patient_id": nbk_pid,
-                                        "slot_number": nbk_slot_num,
-                                    })
-                                    st.session_state["nurse_pat_msg"] = f"Booked for {nbk_name} with {nbk_doc['full_name']}"
-                                    st.rerun()
-                                except Exception as ex:
-                                    st.error(f"Booking failed: {ex}")
+                                nbk_slot_opts.append((si, f"Slot {si} — {t_str}"))
+                            if not nbk_slot_opts:
+                                st.warning("All time slots for this session have already passed.")
+                            else:
+                                nbk_slot_idx = st.selectbox("Time Slot", range(len(nbk_slot_opts)),
+                                                             format_func=lambda i: nbk_slot_opts[i][1], key=f"nbk_slot_{pid}")
+                                nbk_slot_num = nbk_slot_opts[nbk_slot_idx][0]
+                                st.caption(f"**Patient:** {nbk_name}  •  **Doctor:** {nbk_doc['full_name']}  •  **Slot:** {nbk_slot_opts[nbk_slot_idx][1]}")
+                                if st.button("✅ Confirm Booking", key=f"nbk_confirm_{pid}", type="primary", use_container_width=True):
+                                    try:
+                                        api.staff_book({
+                                            "session_id": nbk_sess["session_id"],
+                                            "patient_id": nbk_pid,
+                                            "slot_number": nbk_slot_num,
+                                        })
+                                        st.session_state["nurse_pat_msg"] = f"Booked for {nbk_name} with {nbk_doc['full_name']}"
+                                        st.rerun()
+                                    except Exception as ex:
+                                        st.error(f"Booking failed: {ex}")
 
             # Edit profile
             with na2.popover("✏️ Update Info", use_container_width=True):
+                st.markdown("**Edit Patient Profile**")
+                np_name = st.text_input("Full Name", value=detail.get("full_name") or name or "", key=f"np_fn_{pid}")
+                np_email = st.text_input("Email", value=detail.get("email") or "", key=f"np_em_{pid}")
                 np_phone = st.text_input("Phone", value=detail.get("phone") or "", key=f"np_ph_{pid}")
+                _np_gender_opts = ["", "Male", "Female", "Other"]
+                _np_cur_gender = detail.get("gender") or ""
+                _np_gi = _np_gender_opts.index(_np_cur_gender) if _np_cur_gender in _np_gender_opts else 0
+                np_gender = st.selectbox("Gender", _np_gender_opts, index=_np_gi, key=f"np_gn_{pid}")
                 np_blood = st.selectbox("Blood Group",
                                          ["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"],
                                          index=["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"].index(detail.get("blood_group") or ""),
                                          key=f"np_bg_{pid}")
                 np_abha = st.text_input("ABHA/UHID", value=detail.get("abha_id") or "", key=f"np_abha_{pid}")
+                np_addr = st.text_area("Address", value=detail.get("address") or "", key=f"np_addr_{pid}")
+                st.divider()
+                st.markdown("**Emergency Contact**")
                 np_ec_name = st.text_input("Emergency Name", value=detail.get("emergency_contact_name") or "", key=f"np_ecn_{pid}")
                 np_ec_phone = st.text_input("Emergency Phone", value=detail.get("emergency_contact_phone") or "", key=f"np_ecp_{pid}")
-                np_addr = st.text_input("Address", value=detail.get("address") or "", key=f"np_addr_{pid}")
-                if st.button("Save", key=f"np_save_{pid}", type="primary", use_container_width=True):
+                if st.button("💾 Save", key=f"np_save_{pid}", type="primary", use_container_width=True):
                     payload = {}
-                    if np_phone: payload["phone"] = np_phone
-                    if np_blood: payload["blood_group"] = np_blood
-                    if np_abha: payload["abha_id"] = np_abha
-                    if np_ec_name: payload["emergency_contact_name"] = np_ec_name
-                    if np_ec_phone: payload["emergency_contact_phone"] = np_ec_phone
-                    if np_addr: payload["address"] = np_addr
+                    if np_name and np_name != (detail.get("full_name") or name or ""): payload["full_name"] = np_name
+                    if np_email and np_email != (detail.get("email") or ""): payload["email"] = np_email
+                    if np_phone and np_phone != (detail.get("phone") or ""): payload["phone"] = np_phone
+                    if np_gender and np_gender != (detail.get("gender") or ""): payload["gender"] = np_gender
+                    if np_blood and np_blood != (detail.get("blood_group") or ""): payload["blood_group"] = np_blood
+                    if np_abha and np_abha != (detail.get("abha_id") or ""): payload["abha_id"] = np_abha
+                    if np_ec_name and np_ec_name != (detail.get("emergency_contact_name") or ""): payload["emergency_contact_name"] = np_ec_name
+                    if np_ec_phone and np_ec_phone != (detail.get("emergency_contact_phone") or ""): payload["emergency_contact_phone"] = np_ec_phone
+                    if np_addr and np_addr != (detail.get("address") or ""): payload["address"] = np_addr
                     if payload:
                         try:
                             api.admin_update_patient(pid, payload)
-                            st.session_state["nurse_pat_msg"] = f"Updated {name}"
+                            st.session_state["nurse_pat_msg"] = f"Updated {np_name or name}"
                             st.rerun()
                         except Exception as e:
                             st.error(f"{e}")
@@ -4168,12 +4533,91 @@ def page_admin_patients():
             # ── Family members / Relationships ──
             rels = detail.get("relationships", [])
             if rels:
-                st.markdown("**👨‍👩‍👧‍👦 Family Members**")
-                for r in rels:
-                    rc1, rc2, rc3 = st.columns([3, 2, 1])
-                    rc1.write(f"**{r.get('beneficiary_name', '—')}**")
-                    rc2.write(f"Relation: {(r.get('relationship_type') or '—').title()}")
-                    rc3.write("✅ Linked" if r.get("is_approved") in (True, "True", "true") else "⏳ Pending")
+                st.markdown("**👨‍👩‍👧‍👦 Family Members / Beneficiaries**")
+                for ri, r in enumerate(rels):
+                    b_pid = r.get("beneficiary_patient_id", "")
+                    b_name = r.get("beneficiary_name", "—")
+                    b_rel = (r.get("relationship_type") or "—").title()
+                    b_approved = r.get("is_approved") in (True, "True", "true")
+                    rc1, rc2, rc3, rc4 = st.columns([3, 2, 1, 1])
+                    rc1.write(f"**{b_name}**")
+                    rc2.write(f"Relation: {b_rel}")
+                    rc3.write("✅ Linked" if b_approved else "⏳ Pending")
+                    # View & Edit beneficiary details
+                    if b_pid:
+                        with rc4.popover("👁️ View", use_container_width=True):
+                            try:
+                                b_detail = api.admin_get_patient(b_pid)
+                                st.markdown(f"### {b_detail.get('full_name', b_name)}")
+                                bd1, bd2 = st.columns(2)
+                                with bd1:
+                                    st.write(f"**Email:** {b_detail.get('email') or '—'}")
+                                    st.write(f"**Phone:** {b_detail.get('phone') or '—'}")
+                                    st.write(f"**Gender:** {(b_detail.get('gender') or '—').title()}")
+                                    st.write(f"**DOB:** {b_detail.get('date_of_birth') or '—'}")
+                                    st.write(f"**Blood Group:** {b_detail.get('blood_group') or '—'}")
+                                with bd2:
+                                    st.write(f"**ABHA/UHID:** {b_detail.get('abha_id') or '—'}")
+                                    st.write(f"**Address:** {b_detail.get('address') or '—'}")
+                                    st.write(f"**Emergency:** {b_detail.get('emergency_contact_name') or '—'}")
+                                    st.write(f"**Emergency Ph:** {b_detail.get('emergency_contact_phone') or '—'}")
+                                    b_risk = float(b_detail.get('risk_score') or 0)
+                                    b_risk_dot = "🟢" if b_risk < 3 else "🟡" if b_risk < 7 else "🔴"
+                                    st.write(f"**Risk:** {b_risk_dot} {b_risk:.1f}")
+                                # Beneficiary appointments
+                                b_appts = b_detail.get("appointments", [])
+                                if b_appts:
+                                    st.markdown(f"**Recent Appointments** ({len(b_appts)})")
+                                    for ba in b_appts[:5]:
+                                        ba_s = ba.get("status", "—")
+                                        ba_icon = {"booked": "📅", "checked_in": "✅", "completed": "✔️",
+                                                    "no_show": "⚠️", "cancelled": "❌"}.get(ba_s, "•")
+                                        st.write(f"{ba_icon} {ba.get('session_date', '')} — "
+                                                 f"Dr. {ba.get('doctor_name', '—')} ({ba.get('specialization', '')}) — "
+                                                 f"{ba.get('slot_time', '')} — {ba_s}")
+                                else:
+                                    st.info("No appointments yet.")
+
+                                # ── Edit beneficiary profile ──
+                                st.divider()
+                                st.markdown("**✏️ Edit Profile**")
+                                be_name = st.text_input("Full Name", value=b_detail.get("full_name") or b_name, key=f"be_fn_{pid}_{ri}")
+                                be_email = st.text_input("Email", value=b_detail.get("email") or "", key=f"be_em_{pid}_{ri}")
+                                be_phone = st.text_input("Phone", value=b_detail.get("phone") or "", key=f"be_ph_{pid}_{ri}")
+                                _be_g_opts = ["", "Male", "Female", "Other"]
+                                _be_cur_g = b_detail.get("gender") or ""
+                                _be_gi = _be_g_opts.index(_be_cur_g) if _be_cur_g in _be_g_opts else 0
+                                be_gender = st.selectbox("Gender", _be_g_opts, index=_be_gi, key=f"be_gn_{pid}_{ri}")
+                                be_blood = st.selectbox("Blood Group",
+                                                         ["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"],
+                                                         index=["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"].index(b_detail.get("blood_group") or ""),
+                                                         key=f"be_bg_{pid}_{ri}")
+                                be_abha = st.text_input("ABHA/UHID", value=b_detail.get("abha_id") or "", key=f"be_abha_{pid}_{ri}")
+                                be_addr = st.text_area("Address", value=b_detail.get("address") or "", key=f"be_addr_{pid}_{ri}")
+                                be_ec_name = st.text_input("Emergency Name", value=b_detail.get("emergency_contact_name") or "", key=f"be_ecn_{pid}_{ri}")
+                                be_ec_phone = st.text_input("Emergency Phone", value=b_detail.get("emergency_contact_phone") or "", key=f"be_ecp_{pid}_{ri}")
+                                if st.button("💾 Save Changes", key=f"be_save_{pid}_{ri}", type="primary", use_container_width=True):
+                                    b_payload = {}
+                                    if be_name and be_name != (b_detail.get("full_name") or b_name): b_payload["full_name"] = be_name
+                                    if be_email and be_email != (b_detail.get("email") or ""): b_payload["email"] = be_email
+                                    if be_phone and be_phone != (b_detail.get("phone") or ""): b_payload["phone"] = be_phone
+                                    if be_gender and be_gender != (b_detail.get("gender") or ""): b_payload["gender"] = be_gender
+                                    if be_blood and be_blood != (b_detail.get("blood_group") or ""): b_payload["blood_group"] = be_blood
+                                    if be_abha and be_abha != (b_detail.get("abha_id") or ""): b_payload["abha_id"] = be_abha
+                                    if be_addr and be_addr != (b_detail.get("address") or ""): b_payload["address"] = be_addr
+                                    if be_ec_name and be_ec_name != (b_detail.get("emergency_contact_name") or ""): b_payload["emergency_contact_name"] = be_ec_name
+                                    if be_ec_phone and be_ec_phone != (b_detail.get("emergency_contact_phone") or ""): b_payload["emergency_contact_phone"] = be_ec_phone
+                                    if b_payload:
+                                        try:
+                                            api.admin_update_patient(b_pid, b_payload)
+                                            st.session_state["admin_msg"] = f"Profile updated for {be_name or b_name}"
+                                            st.rerun()
+                                        except Exception as ex:
+                                            st.error(f"{ex}")
+                                    else:
+                                        st.info("No changes to save.")
+                            except Exception as e:
+                                st.error(f"Could not load details: {e}")
 
             # ── Appointment history ──
             appts = detail.get("appointments", [])
@@ -4191,7 +4635,7 @@ def page_admin_patients():
                         "cancelled": ("❌", "#9ca3af"),
                     }
                     a_icon, a_color = s_cfg.get(a_status, ("•", "#666"))
-                    slot_t = str(a.get("start_time", ""))[:5]
+                    slot_t = a.get("slot_time") or str(a.get("start_time", ""))[:5]
                     a_date = a.get("session_date", "—")
                     doc_name = a.get("doctor_name", "—")
                     spec = a.get("specialization", "")
@@ -4276,23 +4720,11 @@ def page_admin_patients():
                                                format_func=lambda i: bk_doc_labels[i], key=f"bk_doc_{pid}")
                     bk_doc = bk_docs[bk_doc_idx]
 
-                    # ── Date picker — admin can book for any date ──
-                    from datetime import date as _bk_d, timedelta as _bk_td
-                    bk_date_opts = ["Today", "Tomorrow", "This Week", "Next Week", "Custom Date"]
-                    bk_date_choice = st.selectbox("📅 Date Range", bk_date_opts, key=f"bk_date_{pid}")
+                    # ── Date picker ──
+                    from datetime import date as _bk_d
                     _bk_today = _bk_d.today()
-                    if bk_date_choice == "Today":
-                        bk_from, bk_to = _bk_today, _bk_today
-                    elif bk_date_choice == "Tomorrow":
-                        bk_from = bk_to = _bk_today + _bk_td(days=1)
-                    elif bk_date_choice == "This Week":
-                        bk_from, bk_to = _bk_today, _bk_today + _bk_td(days=6)
-                    elif bk_date_choice == "Next Week":
-                        bk_from = _bk_today + _bk_td(days=7)
-                        bk_to = _bk_today + _bk_td(days=13)
-                    else:
-                        bk_from = st.date_input("From", value=_bk_today, key=f"bk_from_{pid}")
-                        bk_to = st.date_input("To", value=_bk_today + _bk_td(days=7), key=f"bk_to_{pid}")
+                    bk_date = st.date_input("📅 Date", value=_bk_today, key=f"bk_date_{pid}")
+                    bk_from, bk_to = bk_date, bk_date
 
                     # Load ALL sessions (active + inactive) for the date range
                     try:
@@ -4337,32 +4769,41 @@ def page_admin_patients():
                             bk_total = bk_sess.get("total_slots", 1)
                             bk_dur = bk_sess.get("slot_duration_minutes", 15)
                             bk_start = str(bk_sess.get("start_time", "09:00"))
-                            bk_slot_opts = []
+                            from datetime import datetime as _bk_dt
+                            _bk_now_min = _bk_dt.now().hour * 60 + _bk_dt.now().minute
+                            _bk_is_today = str(bk_date) == str(_bk_d.today())
+                            bk_slot_opts = []  # list of (slot_number, label)
                             for si in range(1, bk_total + 1):
                                 try:
                                     hh, mm = int(bk_start[:2]), int(bk_start[3:5])
                                     t_min = hh * 60 + mm + (si - 1) * bk_dur
+                                    # Skip past slots for today
+                                    if _bk_is_today and t_min + bk_dur <= _bk_now_min:
+                                        continue
                                     t_str = f"{t_min // 60:02d}:{t_min % 60:02d}"
                                 except Exception:
                                     t_str = f"Slot {si}"
-                                bk_slot_opts.append(f"Slot {si} — {t_str}")
-                            bk_slot_idx = st.selectbox("Time Slot", range(len(bk_slot_opts)),
-                                                        format_func=lambda i: bk_slot_opts[i], key=f"bk_slot_{pid}")
-                            bk_slot_num = bk_slot_idx + 1
+                                bk_slot_opts.append((si, f"Slot {si} — {t_str}"))
+                            if not bk_slot_opts:
+                                st.warning("All time slots for this session have already passed.")
+                            else:
+                                bk_slot_idx = st.selectbox("Time Slot", range(len(bk_slot_opts)),
+                                                            format_func=lambda i: bk_slot_opts[i][1], key=f"bk_slot_{pid}")
+                                bk_slot_num = bk_slot_opts[bk_slot_idx][0]
 
-                            st.caption(f"**Patient:** {bk_patient_name}  •  **Doctor:** {bk_doc['full_name']}  •  **Slot:** {bk_slot_opts[bk_slot_idx]}")
+                                st.caption(f"**Patient:** {bk_patient_name}  •  **Doctor:** {bk_doc['full_name']}  •  **Slot:** {bk_slot_opts[bk_slot_idx][1]}")
 
-                            if st.button("✅ Confirm Booking", key=f"bk_confirm_{pid}", type="primary", use_container_width=True):
-                                try:
-                                    result = api.staff_book({
-                                        "session_id": bk_sess["session_id"],
-                                        "patient_id": bk_patient_id,
-                                        "slot_number": bk_slot_num,
-                                    })
-                                    st.session_state["admin_msg"] = f"Appointment booked for {bk_patient_name} with {bk_doc['full_name']}"
-                                    st.rerun()
-                                except Exception as ex:
-                                    st.error(f"Booking failed: {ex}")
+                                if st.button("✅ Confirm Booking", key=f"bk_confirm_{pid}", type="primary", use_container_width=True):
+                                    try:
+                                        result = api.staff_book({
+                                            "session_id": bk_sess["session_id"],
+                                            "patient_id": bk_patient_id,
+                                            "slot_number": bk_slot_num,
+                                        })
+                                        st.session_state["admin_msg"] = f"Appointment booked for {bk_patient_name} with {bk_doc['full_name']}"
+                                        st.rerun()
+                                    except Exception as ex:
+                                        st.error(f"Booking failed: {ex}")
 
             # Risk reset
             with act2.popover("🔧 Reset Risk", use_container_width=True):
@@ -4377,27 +4818,39 @@ def page_admin_patients():
 
             # Edit profile
             with act3.popover("✏️ Edit Profile", use_container_width=True):
+                st.markdown("**Edit Patient Profile**")
+                ep_name = st.text_input("Full Name", value=detail.get("full_name") or name or "", key=f"ep_fn_{pid}")
+                ep_email = st.text_input("Email", value=detail.get("email") or "", key=f"ep_em_{pid}")
                 ep_phone = st.text_input("Phone", value=detail.get("phone") or "", key=f"ep_ph_{pid}")
+                _gender_opts = ["", "Male", "Female", "Other"]
+                _cur_gender = detail.get("gender") or ""
+                _gi = _gender_opts.index(_cur_gender) if _cur_gender in _gender_opts else 0
+                ep_gender = st.selectbox("Gender", _gender_opts, index=_gi, key=f"ep_gn_{pid}")
                 ep_blood = st.selectbox("Blood Group",
                                          ["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"],
                                          index=["", "A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"].index(detail.get("blood_group") or ""),
                                          key=f"ep_bg_{pid}")
                 ep_abha = st.text_input("ABHA/UHID", value=detail.get("abha_id") or "", key=f"ep_abha_{pid}")
-                ep_addr = st.text_input("Address", value=detail.get("address") or "", key=f"ep_addr_{pid}")
+                ep_addr = st.text_area("Address", value=detail.get("address") or "", key=f"ep_addr_{pid}")
+                st.divider()
+                st.markdown("**Emergency Contact**")
                 ep_ec_name = st.text_input("Emergency Name", value=detail.get("emergency_contact_name") or "", key=f"ep_ecn_{pid}")
                 ep_ec_phone = st.text_input("Emergency Phone", value=detail.get("emergency_contact_phone") or "", key=f"ep_ecp_{pid}")
-                if st.button("Save Changes", key=f"ep_save_{pid}", type="primary", use_container_width=True):
+                if st.button("💾 Save Changes", key=f"ep_save_{pid}", type="primary", use_container_width=True):
                     payload = {}
-                    if ep_phone: payload["phone"] = ep_phone
-                    if ep_blood: payload["blood_group"] = ep_blood
-                    if ep_abha: payload["abha_id"] = ep_abha
-                    if ep_addr: payload["address"] = ep_addr
-                    if ep_ec_name: payload["emergency_contact_name"] = ep_ec_name
-                    if ep_ec_phone: payload["emergency_contact_phone"] = ep_ec_phone
+                    if ep_name and ep_name != (detail.get("full_name") or name or ""): payload["full_name"] = ep_name
+                    if ep_email and ep_email != (detail.get("email") or ""): payload["email"] = ep_email
+                    if ep_phone and ep_phone != (detail.get("phone") or ""): payload["phone"] = ep_phone
+                    if ep_gender and ep_gender != (detail.get("gender") or ""): payload["gender"] = ep_gender
+                    if ep_blood and ep_blood != (detail.get("blood_group") or ""): payload["blood_group"] = ep_blood
+                    if ep_abha and ep_abha != (detail.get("abha_id") or ""): payload["abha_id"] = ep_abha
+                    if ep_addr and ep_addr != (detail.get("address") or ""): payload["address"] = ep_addr
+                    if ep_ec_name and ep_ec_name != (detail.get("emergency_contact_name") or ""): payload["emergency_contact_name"] = ep_ec_name
+                    if ep_ec_phone and ep_ec_phone != (detail.get("emergency_contact_phone") or ""): payload["emergency_contact_phone"] = ep_ec_phone
                     if payload:
                         try:
                             api.admin_update_patient(pid, payload)
-                            st.session_state["admin_msg"] = f"Profile updated for {name}"
+                            st.session_state["admin_msg"] = f"Profile updated for {ep_name or name}"
                             st.rerun()
                         except Exception as e:
                             st.error(f"{e}")

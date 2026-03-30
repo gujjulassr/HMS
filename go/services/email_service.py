@@ -317,6 +317,51 @@ async def send_session_cancelled_email(
     )
 
 
+async def send_no_show_email(
+    to_email: str,
+    patient_name: str,
+    doctor_name: str,
+    session_date: str,
+    slot_time: str,
+) -> bool:
+    """Send a no-show notification email to patient who didn't check in."""
+    content = f"""
+    <h2 style="color: #d97706; margin-top: 0;">⚠️ Missed Appointment — No Show</h2>
+    <p>Dear <strong>{patient_name}</strong>,</p>
+    <p>You did not check in for your scheduled appointment and have been marked as a <strong>no-show</strong>.</p>
+    <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+        <tr style="border-bottom: 1px solid #e5e7eb;">
+            <td style="padding: 10px 0; color: #6b7280;">Doctor</td>
+            <td style="padding: 10px 0;">🩺 {doctor_name}</td>
+        </tr>
+        <tr style="border-bottom: 1px solid #e5e7eb;">
+            <td style="padding: 10px 0; color: #6b7280;">Date</td>
+            <td style="padding: 10px 0;">📅 {session_date}</td>
+        </tr>
+        <tr>
+            <td style="padding: 10px 0; color: #6b7280;">Time</td>
+            <td style="padding: 10px 0;">🕐 {slot_time}</td>
+        </tr>
+    </table>
+    <div style="background: #fffbeb; border-left: 4px solid #f59e0b; padding: 12px 16px;
+                border-radius: 4px; margin: 16px 0;">
+        <p style="margin: 0; font-size: 14px; color: #92400e;">
+            ⚠️ A small risk-score penalty has been applied to your profile. Repeated no-shows
+            may affect future booking priority.
+        </p>
+    </div>
+    <p>Please book a new appointment through the patient portal if you still need to be seen.</p>
+    """
+    return await send_email(
+        to_email,
+        f"Missed Appointment (No-Show) — {doctor_name} on {session_date}",
+        _base_template("No-Show Notice", content),
+        plain_body=f"Hi {patient_name}, you missed your appointment with {doctor_name} on "
+                   f"{session_date} at {slot_time} and were marked as a no-show. "
+                   f"A small risk penalty has been applied. Please rebook if needed.",
+    )
+
+
 async def send_checkin_reminder(
     to_email: str,
     patient_name: str,

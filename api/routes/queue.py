@@ -109,13 +109,15 @@ async def _build_queue_entry(
     estimated_time = None
     estimated_wait_minutes = None
 
-    if session:
+    if session and appt.slot_number > 0:
+        # Normal patients — calculate slot time from slot number
         start_min = _time_to_minutes(session.start_time)
         slot_min = start_min + (appt.slot_number - 1) * session.slot_duration_minutes
         original_slot_time = _minutes_to_time(slot_min)
         estimated_min = slot_min + session.delay_minutes
         estimated_time = _minutes_to_time(estimated_min)
         estimated_wait_minutes = max(estimated_min - start_min, 0)
+    # Emergency patients (slot_number=0) have no scheduled time
 
     return QueueEntry(
         appointment_id=str(appt.id),

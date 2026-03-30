@@ -21,11 +21,11 @@ class BookAppointmentRequest(BaseModel):
 
 
 class EmergencyBookRequest(BaseModel):
-    """Staff-only: force-book an emergency patient into position 3."""
+    """Staff-only: add an emergency patient to a session (no slot required)."""
     session_id: str = Field(description="Which session")
-    slot_number: int = Field(ge=1, description="Which slot")
-    patient_id: str = Field(description="Patient who needs emergency slot")
+    patient_id: str = Field(description="Patient who needs emergency care")
     reason: str = Field(min_length=5, description="Why this is an emergency")
+    priority_tier: str = Field(default="CRITICAL", description="Priority: NORMAL, HIGH, or CRITICAL")
 
 
 class CancelAppointmentRequest(BaseModel):
@@ -54,6 +54,8 @@ class AppointmentResponse(BaseModel):
     visual_priority: int
     is_emergency: bool
     status: str
+    slot_duration_minutes: Optional[int] = 15
+    slot_time: Optional[str] = None        # Computed: actual time for this slot (HH:MM)
     delay_minutes: Optional[int] = 0
     checked_in_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None

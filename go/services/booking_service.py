@@ -130,6 +130,8 @@ async def book_appointment(
         raise ValueError(f"Invalid slot number. Must be 1-{session.total_slots}")
 
     # ── Lunch break check (13:00-14:00) ──
+    # No booking during lunch. Morning sessions can't be extended and
+    # afternoon sessions start at 14:00, so no valid slot ever falls here.
     LUNCH_START = 13 * 60  # 1:00 PM
     LUNCH_END = 14 * 60    # 2:00 PM
     slot_start_min = (
@@ -426,14 +428,7 @@ async def cancel_session_appointments(
             text("UPDATE appointments SET status = 'no_show' WHERE id = :aid"),
             {"aid": row["id"]},
         )
-        # Risk penalty for no-show (+0.5)
-        try:
-            await db.execute(
-                text("UPDATE patients SET risk_score = LEAST(risk_score + 0.5, 10.0) WHERE id = :pid"),
-                {"pid": row["patient_id"]},
-            )
-        except Exception:
-            pass
+        # No risk penalty when session is cancelled by staff — not the patient's fault
         no_show_count += 1
 
     # ── Step 1b: Mark checked_in patients as cancelled ────────
@@ -531,4 +526,6 @@ async def cancel_session_appointments(
         "appointments_cancelled": cancelled_count,
         "no_show_count": no_show_count,
         "waitlist_cancelled": waitlist_cancelled,
+        "no_show_appt_ids": [r["id"] for r in booked_rows],
+        "cancelled_appt_ids": [r["id"] for r in checked_in_rows],
     }

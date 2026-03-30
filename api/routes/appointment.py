@@ -47,17 +47,32 @@ async def _enrich_appointment(db: AsyncSession, appt: Appointment) -> Appointmen
     end_time = None
     delay_minutes = 0
 
+    slot_duration_minutes = 15
     if session:
         session_date = session.session_date
         start_time = session.start_time
         end_time = session.end_time
         delay_minutes = session.delay_minutes
+        slot_duration_minutes = session.slot_duration_minutes or 15
         doctor = await DoctorModel.get_by_id(db, session.doctor_id)
         if doctor:
             doc_user = await UserModel.get_by_id(db, doctor.user_id)
             if doc_user:
                 doctor_name = doc_user.full_name
             specialization = doctor.specialization
+
+    # Compute slot-specific time (session_start + (slot_number - 1) * duration)
+    slot_time_str = None
+    if start_time and appt.slot_number > 0:
+        try:
+            hh = start_time.hour if hasattr(start_time, 'hour') else int(str(start_time)[:2])
+            mm = start_time.minute if hasattr(start_time, 'minute') else int(str(start_time)[3:5])
+            total_min = hh * 60 + mm + (appt.slot_number - 1) * slot_duration_minutes
+            slot_time_str = f"{total_min // 60:02d}:{total_min % 60:02d}"
+        except Exception:
+            pass
+    elif appt.slot_number == 0:
+        slot_time_str = "Emergency"
 
     # Get patient name
     patient = await PatientModel.get_by_id(db, appt.patient_id)
@@ -84,6 +99,8 @@ async def _enrich_appointment(db: AsyncSession, appt: Appointment) -> Appointmen
         visual_priority=appt.visual_priority,
         is_emergency=appt.is_emergency,
         status=appt.status,
+        slot_duration_minutes=slot_duration_minutes,
+        slot_time=slot_time_str,
         delay_minutes=delay_minutes,
         checked_in_at=appt.checked_in_at,
         completed_at=appt.completed_at,
@@ -118,8 +135,11 @@ async def book_route(
         appt_response = None
         if result["appointment"]:
             appt_response = await _enrich_appointment(db, result["appointment"])
-            # Send booking confirmation email (fire-and-forget)
-            await notify_booking(db, result["appointment"].id)
+            # Send booking confirmation email + calendar event (fire-and-forget)
+            try:
+                await notify_booking(db, result["appointment"].id)
+            except Exception as e:
+                logger.error("book_route notify failed: %s", e, exc_info=True)
 
         return BookingResultResponse(
             status=result["status"],
@@ -166,11 +186,11 @@ async def cancel_route(
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Cancel failed: {type(e).__name__}: {e}")
 
-    # Send cancellation email (fire-and-forget)
+    # Send cancellation email + calendar event (fire-and-forget)
     try:
         await notify_cancellation(db, UUID(body.appointment_id), reason=body.reason or "")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("cancel_route notify failed: %s", e, exc_info=True)
 
     return CancelResultResponse(
         status=result["status"],
@@ -227,11 +247,11 @@ async def staff_cancel_route(
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Cancel failed: {type(e).__name__}: {e}")
 
-    # Send cancellation email (fire-and-forget)
+    # Send cancellation email + calendar event (fire-and-forget)
     try:
         await notify_cancellation(db, appointment_id, reason=body.reason or "Cancelled by staff")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("staff_cancel notify failed: %s", e, exc_info=True)
 
     return CancelResultResponse(
         status=result["status"],
@@ -265,10 +285,10 @@ async def list_my_appointments(
 
 @router.get("/departments")
 async def list_departments(
-    user: User = Depends(require_role("nurse", "admin")),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return unique specialization list for filter dropdowns."""
+    """Return unique specialization list — available to all authenticated users including patients."""
     from sqlalchemy import text as sql_text
     result = await db.execute(
         sql_text("SELECT DISTINCT specialization FROM doctors WHERE specialization IS NOT NULL ORDER BY specialization")
@@ -453,23 +473,19 @@ async def get_appointment(
 @router.post("/emergency", response_model=BookingResultResponse, status_code=status.HTTP_201_CREATED)
 async def emergency_book_route(
     body: EmergencyBookRequest,
-    user: User = Depends(require_role("nurse", "admin")),
+    user: User = Depends(require_role("nurse", "admin", "doctor")),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Staff-only: force-book a patient into slot position 3 (emergency override).
+    Staff-only: add an emergency patient to a session WITHOUT a slot.
 
-    Bypasses:
-    - Rate limiting (not the patient's choice)
-    - Risk score check (emergency overrides everything)
-    - Waitlist (goes straight to position 3)
+    Emergency patients:
+    - Have NO slot number (slot_number = 0) — they bypass the slot system
+    - Get CRITICAL priority by default (configurable)
+    - Appear in a separate emergency queue
+    - Doctor/nurse can call them at any time, bypassing the normal queue
 
-    Does NOT bypass:
-    - Slot must exist
-    - Position 3 must be free
-    - Patient must exist
-
-    Only nurse and admin can do this. Doctor tells staff, staff does the booking.
+    Bypasses: rate limiting, risk scores, slot availability.
     """
     session_id = UUID(body.session_id)
     patient_id = UUID(body.patient_id)
@@ -480,54 +496,60 @@ async def emergency_book_route(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     if session.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Session is {session.status}")
-    if body.slot_number < 1 or body.slot_number > session.total_slots:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid slot. Must be 1-{session.total_slots}",
-        )
 
     # Validate patient exists
     patient = await PatientModel.get_by_id(db, patient_id)
     if not patient:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
 
-    # Check position 3 is available for this slot
-    slot_position = await AppointmentModel.get_next_slot_position(
-        db, session_id, body.slot_number, is_emergency=True
+    # Validate priority tier
+    priority_tier = (body.priority_tier or "CRITICAL").upper()
+    if priority_tier not in ("NORMAL", "HIGH", "CRITICAL"):
+        priority_tier = "CRITICAL"
+
+    # Emergency patients get slot_number=0; each gets a unique slot_position
+    # to satisfy the unique constraint on (session_id, slot_number, slot_position)
+    from sqlalchemy import text as _txt
+    _pos_result = await db.execute(
+        _txt("SELECT COALESCE(MAX(slot_position), 0) + 1 AS next_pos "
+             "FROM appointments WHERE session_id = :sid AND slot_number = 0"),
+        {"sid": session_id},
     )
-    if slot_position is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="All 3 positions (including emergency) are taken for this slot",
-        )
+    _next_pos = _pos_result.scalar() or 1
 
-    # Calculate priority from patient age
-    from go.services.booking_service import calculate_priority_tier
-    priority_tier = calculate_priority_tier(patient.date_of_birth)
+    # Check if this patient already has an emergency appointment in this session
+    _dup_check = await db.execute(
+        _txt("SELECT id FROM appointments WHERE session_id = :sid AND patient_id = :pid "
+             "AND slot_number = 0 AND status NOT IN ('cancelled', 'no_show')"),
+        {"sid": session_id, "pid": patient_id},
+    )
+    if _dup_check.first():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="This patient already has an emergency entry in this session.")
 
-    # Create the emergency appointment
     appointment = await AppointmentModel.create(
         db,
         session_id=session_id,
         patient_id=patient_id,
-        booked_by_patient_id=patient_id,  # self-booked via staff
-        slot_number=body.slot_number,
-        slot_position=slot_position,
+        booked_by_patient_id=patient_id,
+        slot_number=0,       # 0 = emergency / no slot
+        slot_position=_next_pos,
         priority_tier=priority_tier,
         is_emergency=True,
+        visual_priority=10,
     )
 
-    # Update session booked count
-    await SessionModel.update_booked_count(db, session_id, delta=1)
+    # Auto check-in emergency patients so they appear in the queue immediately
+    await AppointmentModel.update_status(db, appointment.id, "checked_in")
     await db.commit()
 
-    # Audit in separate transaction — failure won't undo the booking
+    # Audit
     try:
         await AuditModel.create(
-            db, action="book", performed_by_user_id=user.id,
+            db, action="emergency_book", performed_by_user_id=user.id,
             appointment_id=appointment.id, patient_id=patient_id,
-            metadata={"slot_number": body.slot_number, "slot_position": slot_position,
-                       "reason": body.reason, "booked_by_staff": str(user.id)},
+            metadata={"reason": body.reason, "priority_tier": priority_tier,
+                       "booked_by_staff": str(user.id)},
         )
         await db.commit()
     except Exception:
@@ -538,7 +560,7 @@ async def emergency_book_route(
 
     return BookingResultResponse(
         status="booked",
-        message=f"Emergency appointment booked: slot {body.slot_number}, position {slot_position}. Reason: {body.reason}",
+        message=f"Emergency patient added to session queue. Priority: {priority_tier}. Reason: {body.reason}",
         appointment=appt_response,
         waitlist_position=None,
     )
@@ -790,11 +812,11 @@ async def staff_book(
         logger.error("staff_book create failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Booking failed: {type(e).__name__}: {e}")
 
-    # Send booking confirmation email (fire-and-forget)
+    # Send booking confirmation email + calendar event (fire-and-forget)
     try:
         await notify_booking(db, appointment.id)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("staff_book notify_booking failed: %s", e, exc_info=True)
 
     # Build response — all in try/except so booking is never lost
     doc_name = "Doctor"

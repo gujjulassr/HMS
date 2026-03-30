@@ -49,6 +49,16 @@ class CompleteSessionRequest(BaseModel):
     note: Optional[str] = Field(None, description="Optional closing note")
 
 
+class CreateSessionRequest(BaseModel):
+    """Create a new session for a doctor."""
+    doctor_id: Optional[str] = Field(None, description="Doctor UUID. Omit for self (doctor role).")
+    session_date: str = Field(description="Date YYYY-MM-DD")
+    start_time: str = Field(description="Start time HH:MM (24h)")
+    end_time: str = Field(description="End time HH:MM (24h)")
+    slot_duration_minutes: int = Field(15, ge=5, le=60, description="Minutes per slot")
+    max_patients_per_slot: int = Field(2, ge=1, le=10, description="Max patients per slot")
+
+
 class CancelSessionRequest(BaseModel):
     """Cancel entire session — all appointments affected."""
     session_id: str

@@ -247,8 +247,8 @@ class SessionModel:
                 UPDATE sessions
                 SET end_time = :new_end,
                     actual_end_time = :new_end,
-                    total_slots = EXTRACT(EPOCH FROM (:new_end - start_time)) / 60
-                                  / slot_duration_minutes,
+                    total_slots = FLOOR(EXTRACT(EPOCH FROM (:new_end - start_time)) / 60
+                                  / slot_duration_minutes)::int,
                     notes = :note_val
                 WHERE id = :id AND status = 'active'
                 RETURNING *

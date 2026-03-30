@@ -515,7 +515,7 @@ async def list_patients(
     joins = ""
 
     if search:
-        conditions.append("(u.full_name ILIKE :search OR u.phone ILIKE :search)")
+        conditions.append("(u.full_name ILIKE :search OR u.phone ILIKE :search OR u.email ILIKE :search OR COALESCE(p.abha_id, '') ILIKE :search)")
         params["search"] = f"%{search}%"
     if high_risk_only:
         conditions.append("p.risk_score >= 7.0")
@@ -576,16 +576,17 @@ async def reset_patient_risk(
 @router.get("/patients/{patient_id}")
 async def get_patient_detail(
     patient_id: str,
-    user: User = Depends(require_role("admin", "nurse")),
+    user: User = Depends(require_role("admin", "nurse", "doctor")),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get full patient details including profile, relationships, and appointments. Accessible by admin and nurse."""
+    """Get full patient details including profile, relationships, and appointments. Accessible by staff."""
     pid = UUID(patient_id)
 
     # Patient + user profile
     profile = await db.execute(
         text("""
-            SELECT p.id AS patient_id, p.abha_id, p.date_of_birth, p.gender,
+            SELECT p.id AS patient_id, u.id AS user_id,
+                   p.abha_id, p.date_of_birth, p.gender,
                    p.blood_group, p.risk_score, p.address,
                    p.emergency_contact_name, p.emergency_contact_phone,
                    u.full_name, u.email, u.phone, u.is_active, u.created_at
@@ -605,6 +606,7 @@ async def get_patient_detail(
             SELECT a.id AS appointment_id, a.status, a.slot_number,
                    a.checked_in_at, a.completed_at, a.notes,
                    s.session_date, s.start_time, s.end_time,
+                   s.slot_duration_minutes,
                    u_d.full_name AS doctor_name, d.specialization
             FROM appointments a
             JOIN sessions s ON a.session_id = s.id
@@ -616,7 +618,21 @@ async def get_patient_detail(
         """),
         {"pid": pid},
     )
-    appt_list = [{k: str(v) if v is not None else None for k, v in r.items()} for r in appts.mappings().all()]
+    appt_list = []
+    for r in appts.mappings().all():
+        row_dict = {k: str(v) if v is not None else None for k, v in r.items()}
+        # Compute slot-specific time from session start + (slot - 1) * duration
+        try:
+            st_val = r["start_time"]
+            dur = r["slot_duration_minutes"] or 15
+            slot = r["slot_number"]
+            hh = st_val.hour if hasattr(st_val, "hour") else int(str(st_val)[:2])
+            mm = st_val.minute if hasattr(st_val, "minute") else int(str(st_val)[3:5])
+            total_min = hh * 60 + mm + (slot - 1) * dur
+            row_dict["slot_time"] = f"{total_min // 60:02d}:{total_min % 60:02d}"
+        except Exception:
+            row_dict["slot_time"] = None
+        appt_list.append(row_dict)
 
     # Family relationships
     rels = await db.execute(
@@ -639,13 +655,23 @@ async def get_patient_detail(
 async def admin_update_patient(
     patient_id: str,
     body: dict,
-    user: User = Depends(require_role("admin", "nurse")),
+    user: User = Depends(require_role("admin", "nurse", "doctor")),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin/nurse can update patient profile fields."""
+    """Staff can update patient profile fields (name, email, phone, etc)."""
     pid = UUID(patient_id)
+
+    # ── Verify patient exists first ──
+    check = await db.execute(
+        text("SELECT p.id, u.id AS user_id FROM patients p JOIN users u ON p.user_id = u.id WHERE p.id = :pid"),
+        {"pid": pid},
+    )
+    patient_row = check.mappings().first()
+    if not patient_row:
+        raise HTTPException(404, f"Patient {patient_id} not found")
+
     allowed = {
-        "phone", "blood_group", "abha_id", "address",
+        "full_name", "email", "phone", "blood_group", "abha_id", "address",
         "emergency_contact_name", "emergency_contact_phone", "gender",
     }
     updates = {k: v for k, v in body.items() if k in allowed and v is not None}
@@ -653,25 +679,50 @@ async def admin_update_patient(
         raise HTTPException(400, "No valid fields to update")
 
     # Split user vs patient fields
-    user_fields = {"phone"}
+    user_fields = {"phone", "email", "full_name"}
     patient_fields = allowed - user_fields
+    rows_affected = 0
 
     if any(k in user_fields for k in updates):
         user_sets = ", ".join(f"{k} = :{k}" for k in updates if k in user_fields)
         if user_sets:
-            await db.execute(
-                text(f"UPDATE users SET {user_sets} WHERE id = (SELECT user_id FROM patients WHERE id = :pid)"),
-                {**{k: updates[k] for k in updates if k in user_fields}, "pid": pid},
+            result = await db.execute(
+                text(f"UPDATE users SET {user_sets} WHERE id = :uid"),
+                {**{k: updates[k] for k in updates if k in user_fields}, "uid": patient_row["user_id"]},
             )
+            rows_affected += result.rowcount
     if any(k in patient_fields for k in updates):
         patient_sets = ", ".join(f"{k} = :{k}" for k in updates if k in patient_fields)
         if patient_sets:
-            await db.execute(
+            result = await db.execute(
                 text(f"UPDATE patients SET {patient_sets}, updated_at = NOW() WHERE id = :pid"),
                 {**{k: updates[k] for k in updates if k in patient_fields}, "pid": pid},
             )
+            rows_affected += result.rowcount
+
+    if rows_affected == 0:
+        raise HTTPException(500, "Update failed — no rows were modified")
+
     await db.commit()
-    return {"message": "Patient updated", "patient_id": patient_id}
+
+    # ── Return the actual updated data so callers see real values ──
+    updated = await db.execute(
+        text("""
+            SELECT u.full_name, u.email, u.phone, p.gender, p.blood_group,
+                   p.abha_id, p.address, p.emergency_contact_name, p.emergency_contact_phone
+            FROM patients p JOIN users u ON p.user_id = u.id WHERE p.id = :pid
+        """),
+        {"pid": pid},
+    )
+    row = updated.mappings().first()
+    updated_data = {k: str(v) if v is not None else None for k, v in row.items()} if row else {}
+
+    return {
+        "message": "Patient updated successfully",
+        "patient_id": patient_id,
+        "updated_fields": list(updates.keys()),
+        "current_data": updated_data,
+    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -739,3 +790,61 @@ async def list_all_sessions(
     except Exception as e:
         logger.exception("Admin sessions endpoint failed")
         raise HTTPException(500, detail=f"Sessions query failed: {str(e)}")
+
+
+# ─── POST /admin/quick-register — staff quick-register a walk-in patient ────
+
+@router.post("/quick-register")
+async def quick_register_patient(
+    body: dict,
+    user: User = Depends(require_role("nurse", "admin", "doctor")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Quick-register a new patient with minimal info (name only). Returns patient_id."""
+    import uuid as _uuid
+    from datetime import date as _date_type
+    from go.models.patient_relationship import RelationshipModel
+
+    full_name = (body.get("full_name") or "").strip()
+    if not full_name or len(full_name) < 2:
+        raise HTTPException(400, "Full name is required (min 2 chars)")
+
+    phone = (body.get("phone") or "").strip() or None
+    placeholder_email = f"walkin_{_uuid.uuid4().hex[:8]}@dpms.local"
+
+    # 1. Create user
+    new_user = await UserModel.create(
+        db,
+        email=placeholder_email,
+        full_name=full_name,
+        role="patient",
+        password_hash="WALKIN_NO_LOGIN",
+        phone=phone,
+    )
+
+    # 2. Create patient record
+    new_patient = await PatientModel.create(
+        db,
+        user_id=new_user.id,
+        date_of_birth=_date_type(2000, 1, 1),
+        gender="other",
+    )
+
+    # 3. Self-relationship
+    try:
+        await RelationshipModel.create(
+            db,
+            booker_patient_id=new_patient.id,
+            beneficiary_patient_id=new_patient.id,
+            relationship_type="self",
+        )
+    except Exception:
+        pass
+
+    await db.commit()
+
+    return {
+        "status": "registered",
+        "message": f"{full_name} registered successfully.",
+        "patient_id": str(new_patient.id),
+    }

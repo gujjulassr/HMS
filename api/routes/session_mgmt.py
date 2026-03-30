@@ -29,8 +29,9 @@ from lo.models.appointment import Appointment, AppointmentModel
 from lo.models.notification_log import NotificationModel
 from lo.models.booking_audit_log import AuditModel
 from go.services.booking_service import cancel_session_appointments
-from go.services.notification_dispatcher import notify_delay_for_session, notify_session_cancelled
+from go.services.notification_dispatcher import notify_delay_for_session, notify_session_cancelled, notify_session_completed
 from api.schemas.session_schemas import (
+    CreateSessionRequest,
     DoctorCheckinRequest,
     UpdateDelayRequest,
     OvertimeWindowRequest,
@@ -265,22 +266,25 @@ async def set_overtime_window(
 
     # Get clinic config for limits
     config = await _get_clinic_time_config(db)
+    lunch_end_min = _time_to_minutes(config["lunch_end"])
+
+    # Morning sessions cannot be extended — pending patients carry over to afternoon
+    session_start_min = _time_to_minutes(session.start_time)
+    if session_start_min < lunch_end_min:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Morning sessions cannot be extended. Pending patients will automatically "
+                   "carry over to the afternoon session when you complete this session.",
+        )
 
     # Calculate overtime end time
     end_min = _time_to_minutes(session.end_time)
     overtime_end_min = end_min + body.overtime_minutes
-    lunch_start_min = _time_to_minutes(config["lunch_start"])
-    clinic_close_min = _time_to_minutes(config["clinic_close"])
 
-    # Cap overtime: can't go into lunch or past clinic close
-    # Morning session (ends before lunch): cap at lunch_start
-    if end_min <= lunch_start_min:
-        overtime_end_min = min(overtime_end_min, lunch_start_min)
-    # Afternoon session: cap at clinic_close
-    else:
-        overtime_end_min = min(overtime_end_min, clinic_close_min)
+    # Cap at end of day (23:59)
+    overtime_end_min = min(overtime_end_min, 23 * 60 + 59)
 
-    # Also cap at max overtime
+    # Also cap at max overtime config (soft recommendation)
     max_overtime = config["overtime_max"]
     overtime_end_min = min(overtime_end_min, end_min + max_overtime)
 
@@ -344,7 +348,7 @@ async def set_overtime_window(
     msg = f"Overtime: {actual_overtime} min (until {overtime_end_time.strftime('%I:%M %p')}). "
     msg += f"{len(can_be_seen)} patients can be seen, {len(cannot_be_seen)} cannot."
     if overtime_end_min < end_min + body.overtime_minutes:
-        msg += " (Capped by lunch hours or clinic close time.)"
+        msg += " (Capped by max overtime limit.)"
 
     return OvertimeWindowResponse(
         session_id=str(session.id),
@@ -384,6 +388,17 @@ async def extend_session(
     lunch_end_min = _time_to_minutes(config["lunch_end"])
     clinic_close_min = _time_to_minutes(config["clinic_close"])
 
+    # ── Morning sessions cannot be extended ──
+    # Pending patients from morning carry over to afternoon session automatically.
+    # Only afternoon/later sessions (starting at or after lunch end) can be extended.
+    session_start_min = _time_to_minutes(session.start_time)
+    if session_start_min < lunch_end_min:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Morning sessions cannot be extended. Pending patients will automatically "
+                   "carry over to the afternoon session when you complete this session.",
+        )
+
     # ── New end must be after current end ──
     if new_end_min <= end_min:
         raise HTTPException(
@@ -391,26 +406,11 @@ async def extend_session(
             detail=f"New end time must be after current end time ({session.end_time}).",
         )
 
-    # ── Lunch hour check (only if session currently ends BEFORE lunch) ──
-    # If session already overlaps with lunch, extending further is fine
-    # (doctor is finishing existing patients, not creating new work during lunch)
-    if end_min <= lunch_start_min:
-        if new_end_min > lunch_start_min and new_end_min < lunch_end_min:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot extend into lunch period ({config['lunch_start']} - {config['lunch_end']}). "
-                       f"Max extension for morning: {config['lunch_start']}",
-            )
-
-    # ── Can't extend past clinic close ──
-    # Exception: if current time is already past clinic close
-    # (doctor is still at hospital), allow extension up to 23:59
-    from datetime import datetime as _dt_now
-    _now_min = _dt_now.now().hour * 60 + _dt_now.now().minute
-    if new_end_min > clinic_close_min and _now_min < clinic_close_min:
+    # Upper hard-cap: 23:59 (end of day).
+    if new_end_min > 23 * 60 + 59:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot extend past clinic close ({config['clinic_close']})",
+            detail="Cannot extend past 23:59.",
         )
 
     overtime_minutes = new_end_min - end_min
@@ -530,25 +530,120 @@ async def complete_session_route(
         except Exception:
             pass
 
-    # Mark checked_in patients as cancelled (showed up but couldn't be seen — no penalty)
-    cancelled_result = await db.execute(
-        sql_text(
-            "UPDATE appointments SET status = 'cancelled' "
-            "WHERE session_id = :sid AND status = 'checked_in'"
-        ),
-        {"sid": UUID(body.session_id)},
-    )
-    cancelled_count = cancelled_result.rowcount
+    # ── Carry-over: try to move checked_in patients to a later same-day session ──
+    carried_over_count = 0
+    truly_cancelled_rows = list(checked_in_rows)  # default: all get cancelled
+    carried_over_ids = []
+
+    if checked_in_rows:
+        # Look for a later active session on the same day by the same doctor
+        later_session = await db.execute(
+            sql_text(
+                "SELECT id, total_slots, booked_count, start_time "
+                "FROM sessions "
+                "WHERE doctor_id = :did AND session_date = :sdate "
+                "  AND status = 'active' AND id != :sid "
+                "  AND start_time > :current_end "
+                "ORDER BY start_time ASC LIMIT 1"
+            ),
+            {
+                "did": session.doctor_id,
+                "sdate": session.session_date,
+                "sid": UUID(body.session_id),
+                "current_end": session.end_time,
+            },
+        )
+        target = later_session.mappings().first()
+
+        if target:
+            target_sid = target["id"]
+            target_total_slots = target["total_slots"]
+            truly_cancelled_rows = []
+
+            for row in checked_in_rows:
+                # Find next available slot in the target session (position 1 or 2)
+                next_pos = await db.execute(
+                    sql_text(
+                        "SELECT MIN(s_num) AS slot_num FROM ("
+                        "  SELECT g.n AS s_num FROM generate_series(1, :total) g(n) "
+                        "  WHERE (SELECT COUNT(*) FROM appointments "
+                        "         WHERE session_id = :sid AND slot_number = g.n "
+                        "         AND status != 'cancelled') < 2"
+                        ") available"
+                    ),
+                    {"total": target_total_slots, "sid": target_sid},
+                )
+                avail = next_pos.scalar()
+
+                if avail is not None:
+                    # Find the actual position (1 or 2) in that slot
+                    pos_result = await db.execute(
+                        sql_text(
+                            "SELECT COALESCE(MAX(slot_position), 0) + 1 AS next_pos "
+                            "FROM appointments "
+                            "WHERE session_id = :sid AND slot_number = :slot "
+                            "AND status != 'cancelled'"
+                        ),
+                        {"sid": target_sid, "slot": avail},
+                    )
+                    next_slot_pos = pos_result.scalar() or 1
+
+                    # Move patient: reset to booked in afternoon session
+                    await db.execute(
+                        sql_text(
+                            "UPDATE appointments "
+                            "SET session_id = :new_sid, slot_number = :slot, "
+                            "    slot_position = :pos, status = 'booked', "
+                            "    checked_in_at = NULL "
+                            "WHERE id = :aid"
+                        ),
+                        {"new_sid": target_sid, "slot": avail, "pos": next_slot_pos, "aid": row["id"]},
+                    )
+                    # Update booked counts
+                    await db.execute(
+                        sql_text("UPDATE sessions SET booked_count = booked_count + 1 WHERE id = :id"),
+                        {"id": target_sid},
+                    )
+                    carried_over_count += 1
+                    carried_over_ids.append(row["id"])
+                else:
+                    # No space in afternoon session — cancel this one
+                    truly_cancelled_rows.append(row)
+
+    # Mark remaining checked_in patients as cancelled (no slot in afternoon)
+    cancelled_count = 0
+    cancelled_appt_ids = []
+    for row in truly_cancelled_rows:
+        await db.execute(
+            sql_text(
+                "UPDATE appointments SET status = 'cancelled' "
+                "WHERE id = :aid AND status = 'checked_in'"
+            ),
+            {"aid": row["id"]},
+        )
+        cancelled_count += 1
+        cancelled_appt_ids.append(row["id"])
 
     # Complete the session
     success = await SessionModel.complete_session(db, UUID(body.session_id))
     if not success:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to complete session")
 
-    # Commit core changes first (no_show, cancelled, session completed)
+    # Commit core changes (no_show, cancelled, carry-over, session completed)
     await db.commit()
 
-    # Best-effort notifications (post-commit, so failures don't rollback the session)
+    # ── Best-effort email notifications (post-commit) ──
+    no_show_appt_ids = [row["id"] for row in booked_rows]
+    try:
+        await notify_session_completed(
+            db, UUID(body.session_id),
+            no_show_ids=no_show_appt_ids,
+            cancelled_ids=cancelled_appt_ids,
+        )
+    except Exception:
+        pass  # Email failures never block core flow
+
+    # Best-effort push notifications (in addition to emails)
     for row in booked_rows:
         try:
             patient = await PatientModel.get_by_id(db, row["patient_id"])
@@ -564,7 +659,7 @@ async def complete_session_route(
             try: await db.rollback()
             except Exception: pass
 
-    for row in checked_in_rows:
+    for row in truly_cancelled_rows:
         try:
             patient = await PatientModel.get_by_id(db, row["patient_id"])
             if patient:
@@ -579,6 +674,14 @@ async def complete_session_route(
             try: await db.rollback()
             except Exception: pass
 
+    # Notify carried-over patients (booking confirmation for new session)
+    for appt_id in carried_over_ids:
+        try:
+            from go.services.notification_dispatcher import notify_booking
+            await notify_booking(db, appt_id)
+        except Exception:
+            pass
+
     # Best-effort audit log
     try:
         await AuditModel.create(
@@ -587,6 +690,7 @@ async def complete_session_route(
                 "session_id": body.session_id,
                 "no_show_count": no_show_count,
                 "cancelled_count": cancelled_count,
+                "carried_over_count": carried_over_count,
                 "note": body.note,
             },
         )
@@ -600,6 +704,8 @@ async def complete_session_route(
         parts.append(f"{no_show_count} no-show")
     if cancelled_count:
         parts.append(f"{cancelled_count} cancelled")
+    if carried_over_count:
+        parts.append(f"{carried_over_count} carried over to next session")
     summary = ", ".join(parts) if parts else "no pending patients"
 
     return SessionStatusResponse(
@@ -610,6 +716,123 @@ async def complete_session_route(
         notes=body.note,
         message=f"Session completed. {summary}.",
     )
+
+
+# ─── POST /create — create a new session ─────────────────────
+
+@router.post("/create")
+async def create_session(
+    body: CreateSessionRequest,
+    user: User = Depends(require_role("doctor", "nurse", "admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new session for a doctor. Doctors can only create for themselves."""
+    from datetime import date as _date_cls, time as _time_cls
+
+    # Resolve doctor_id
+    if body.doctor_id:
+        doctor_id = UUID(body.doctor_id)
+    elif user.role == "doctor":
+        doctor = await DoctorModel.get_by_user_id(db, user.id)
+        if not doctor:
+            raise HTTPException(status_code=404, detail="Doctor profile not found for this user")
+        doctor_id = doctor.id
+    else:
+        raise HTTPException(status_code=400, detail="doctor_id is required for non-doctor users")
+
+    # Verify doctor exists
+    doctor = await DoctorModel.get_by_id(db, doctor_id)
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    # Parse date and times
+    try:
+        session_date = _date_cls.fromisoformat(body.session_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    try:
+        sh, sm = body.start_time.split(":")
+        start_time = _time_cls(int(sh), int(sm))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid start_time. Use HH:MM.")
+    try:
+        eh, em = body.end_time.split(":")
+        end_time = _time_cls(int(eh), int(em))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid end_time. Use HH:MM.")
+
+    if start_time >= end_time:
+        raise HTTPException(status_code=400, detail="start_time must be before end_time")
+
+    # Check for overlapping sessions — if one exists and is inactive, return it
+    overlap = await db.execute(
+        sql_text("""
+            SELECT id, status, start_time, end_time, total_slots
+            FROM sessions
+            WHERE doctor_id = :did AND session_date = :sd
+              AND start_time < :et AND end_time > :st
+              AND status != 'cancelled'
+            LIMIT 1
+        """),
+        {"did": doctor_id, "sd": session_date, "st": start_time, "et": end_time},
+    )
+    existing = overlap.mappings().first()
+    if existing:
+        ex_status = existing["status"]
+        ex_id = str(existing["id"])
+        if ex_status == "inactive":
+            # Auto-activate the existing inactive session
+            await db.execute(
+                sql_text("UPDATE sessions SET status = 'active' WHERE id = :sid"),
+                {"sid": existing["id"]},
+            )
+            await db.commit()
+            return {
+                "status": "activated",
+                "message": f"An inactive session already existed for {body.session_date} {existing['start_time']}-{existing['end_time']}. It has been activated.",
+                "session_id": ex_id,
+                "session_date": body.session_date,
+                "start_time": str(existing["start_time"]),
+                "end_time": str(existing["end_time"]),
+                "total_slots": existing["total_slots"],
+                "session_status": "active",
+            }
+        else:
+            return {
+                "status": "exists",
+                "message": f"A session already exists for {body.session_date} {existing['start_time']}-{existing['end_time']} (status: {ex_status}).",
+                "session_id": ex_id,
+                "session_date": body.session_date,
+                "start_time": str(existing["start_time"]),
+                "end_time": str(existing["end_time"]),
+                "total_slots": existing["total_slots"],
+                "session_status": ex_status,
+            }
+
+    # Create new session as inactive
+    session = await SessionModel.create(
+        db, doctor_id=doctor_id, session_date=session_date,
+        start_time=start_time, end_time=end_time,
+        slot_duration_minutes=body.slot_duration_minutes,
+        max_patients_per_slot=body.max_patients_per_slot,
+    )
+    # Auto-activate new session
+    await db.execute(
+        sql_text("UPDATE sessions SET status = 'active' WHERE id = :sid"),
+        {"sid": session.id},
+    )
+    await db.commit()
+
+    return {
+        "status": "created",
+        "message": f"Session created and activated for {body.session_date} {body.start_time}-{body.end_time}.",
+        "session_id": str(session.id),
+        "session_date": str(session.session_date),
+        "start_time": str(session.start_time),
+        "end_time": str(session.end_time),
+        "total_slots": session.total_slots,
+        "session_status": "active",
+    }
 
 
 # ─── POST /activate — set session from inactive → active ─────
@@ -719,9 +942,13 @@ async def cancel_session_route(
             performed_by_user_id=user.id,
             reason=body.reason,
         )
-        # Send cancellation emails to all affected patients (fire-and-forget)
+        # Send differentiated emails: no-show email for booked, cancellation email for checked_in
         try:
-            await notify_session_cancelled(db, UUID(body.session_id), reason=body.reason or "")
+            await notify_session_completed(
+                db, UUID(body.session_id),
+                no_show_ids=result.get("no_show_appt_ids", []),
+                cancelled_ids=result.get("cancelled_appt_ids", []),
+            )
         except Exception:
             pass  # Email failures never block the core flow
         return CancelSessionResponse(

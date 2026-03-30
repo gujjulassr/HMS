@@ -23,6 +23,7 @@ from go.services.email_service import (
     send_cancellation_email,
     send_delay_notification,
     send_session_cancelled_email,
+    send_no_show_email,
     send_email_background,
 )
 
@@ -86,12 +87,18 @@ async def notify_booking(db: AsyncSession, appointment_id):
     """
     try:
         ctx = await _get_appointment_email_context(db, UUID(str(appointment_id)))
-        if not ctx or not ctx.get("patient_email"):
+        if not ctx:
+            logger.warning("notify_booking: no context found for appointment %s", appointment_id)
+            return
+        if not ctx.get("patient_email"):
+            logger.warning("notify_booking: no patient email for appointment %s", appointment_id)
             return
         if "@dpms.local" in ctx["patient_email"]:
+            logger.info("notify_booking: skipping @dpms.local email for %s", appointment_id)
             return
+        logger.info("notify_booking: sending to %s for appointment %s", ctx["patient_email"], appointment_id)
     except Exception as e:
-        logger.error("notify_booking context error: %s", e)
+        logger.error("notify_booking context error: %s", e, exc_info=True)
         return
 
     async def _send():
@@ -123,12 +130,18 @@ async def notify_cancellation(db: AsyncSession, appointment_id, reason: str = ""
     """
     try:
         ctx = await _get_appointment_email_context(db, UUID(str(appointment_id)))
-        if not ctx or not ctx.get("patient_email"):
+        if not ctx:
+            logger.warning("notify_cancellation: no context found for appointment %s", appointment_id)
+            return
+        if not ctx.get("patient_email"):
+            logger.warning("notify_cancellation: no patient email for appointment %s", appointment_id)
             return
         if "@dpms.local" in ctx["patient_email"]:
+            logger.info("notify_cancellation: skipping @dpms.local email for %s", appointment_id)
             return
+        logger.info("notify_cancellation: sending to %s for appointment %s", ctx["patient_email"], appointment_id)
     except Exception as e:
-        logger.error("notify_cancellation context error: %s", e)
+        logger.error("notify_cancellation context error: %s", e, exc_info=True)
         return
 
     async def _send():
@@ -204,6 +217,112 @@ async def notify_delay_for_session(db: AsyncSession, session_id: UUID, delay_min
         logger.info("Delay notifications sent for session %s (%d patients)", session_id, len(rows))
     except Exception as e:
         logger.error("notify_delay_for_session error: %s", e)
+
+
+async def notify_session_completed(db: AsyncSession, session_id: UUID,
+                                    no_show_ids: list = None, cancelled_ids: list = None):
+    """
+    Send emails when a session is completed:
+    - no_show patients (booked but never checked in) → no-show email
+    - cancelled patients (checked_in but not seen) → cancellation email
+    """
+    no_show_ids = no_show_ids or []
+    cancelled_ids = cancelled_ids or []
+
+    try:
+        # Send no-show emails
+        for appt_id in no_show_ids:
+            try:
+                result = await db.execute(
+                    text("""
+                        SELECT u.full_name AS patient_name, u.email AS patient_email,
+                               u_d.full_name AS doctor_name,
+                               s.session_date, s.start_time, s.slot_duration_minutes,
+                               a.slot_number
+                        FROM appointments a
+                        JOIN patients p ON a.patient_id = p.id
+                        JOIN users u ON p.user_id = u.id
+                        JOIN sessions s ON a.session_id = s.id
+                        JOIN doctors d ON s.doctor_id = d.id
+                        JOIN users u_d ON d.user_id = u_d.id
+                        WHERE a.id = :aid
+                    """),
+                    {"aid": appt_id},
+                )
+                row = result.mappings().first()
+                if not row or not row["patient_email"] or "@dpms.local" in row["patient_email"]:
+                    continue
+                # Calculate slot time
+                try:
+                    start = row["start_time"]
+                    dur = row["slot_duration_minutes"]
+                    slot = row["slot_number"]
+                    hh = start.hour if hasattr(start, 'hour') else int(str(start)[:2])
+                    mm = start.minute if hasattr(start, 'minute') else int(str(start)[3:5])
+                    total_min = hh * 60 + mm + (slot - 1) * dur
+                    slot_time = f"{total_min // 60:02d}:{total_min % 60:02d}"
+                except Exception:
+                    slot_time = "—"
+
+                await send_no_show_email(
+                    to_email=row["patient_email"],
+                    patient_name=row["patient_name"],
+                    doctor_name=row["doctor_name"],
+                    session_date=str(row["session_date"]),
+                    slot_time=slot_time,
+                )
+            except Exception as e:
+                logger.error("notify_session_completed no-show email error for %s: %s", appt_id, e)
+
+        # Send cancellation emails to checked_in patients who couldn't be seen
+        for appt_id in cancelled_ids:
+            try:
+                result = await db.execute(
+                    text("""
+                        SELECT u.full_name AS patient_name, u.email AS patient_email,
+                               u_d.full_name AS doctor_name,
+                               s.session_date, s.start_time, s.slot_duration_minutes,
+                               a.slot_number
+                        FROM appointments a
+                        JOIN patients p ON a.patient_id = p.id
+                        JOIN users u ON p.user_id = u.id
+                        JOIN sessions s ON a.session_id = s.id
+                        JOIN doctors d ON s.doctor_id = d.id
+                        JOIN users u_d ON d.user_id = u_d.id
+                        WHERE a.id = :aid
+                    """),
+                    {"aid": appt_id},
+                )
+                row = result.mappings().first()
+                if not row or not row["patient_email"] or "@dpms.local" in row["patient_email"]:
+                    continue
+                try:
+                    start = row["start_time"]
+                    dur = row["slot_duration_minutes"]
+                    slot = row["slot_number"]
+                    hh = start.hour if hasattr(start, 'hour') else int(str(start)[:2])
+                    mm = start.minute if hasattr(start, 'minute') else int(str(start)[3:5])
+                    total_min = hh * 60 + mm + (slot - 1) * dur
+                    slot_time = f"{total_min // 60:02d}:{total_min % 60:02d}"
+                except Exception:
+                    slot_time = "—"
+
+                await send_cancellation_email(
+                    to_email=row["patient_email"],
+                    patient_name=row["patient_name"],
+                    doctor_name=row["doctor_name"],
+                    session_date=str(row["session_date"]),
+                    slot_time=slot_time,
+                    reason="Session ended before you could be seen. No penalty applied.",
+                    appointment_id=str(appt_id),
+                )
+            except Exception as e:
+                logger.error("notify_session_completed cancellation email error for %s: %s", appt_id, e)
+
+        logger.info("Session completion emails sent for %s (no_show=%d, cancelled=%d)",
+                     session_id, len(no_show_ids), len(cancelled_ids))
+    except Exception as e:
+        logger.error("notify_session_completed error: %s", e)
 
 
 async def notify_session_cancelled(db: AsyncSession, session_id: UUID, reason: str = ""):

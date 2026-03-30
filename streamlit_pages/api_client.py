@@ -283,6 +283,13 @@ def emergency_book(payload: dict) -> dict:
     return r.json()
 
 
+def quick_register_patient(payload: dict) -> dict:
+    r = _request("POST", f"{BASE_URL}/admin/quick-register", json=payload)
+    if r.status_code >= 400:
+        _raise_api_error(r)
+    return r.json()
+
+
 # ─── Session Management ──────────────────────────────────────
 
 def doctor_checkin(payload: dict) -> dict:

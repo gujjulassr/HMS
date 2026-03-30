@@ -53,15 +53,16 @@ class AppointmentModel:
         slot_position: int,
         priority_tier: str,
         is_emergency: bool = False,
+        visual_priority: int = 5,
     ) -> Appointment:
         result = await db.execute(
             text("""
                 INSERT INTO appointments
                     (session_id, patient_id, booked_by_patient_id,
-                     slot_number, slot_position, priority_tier, is_emergency)
+                     slot_number, slot_position, priority_tier, is_emergency, visual_priority)
                 VALUES
                     (:session_id, :patient_id, :booked_by,
-                     :slot_num, :slot_pos, :priority, :is_emergency)
+                     :slot_num, :slot_pos, :priority, :is_emergency, :visual_priority)
                 RETURNING *
             """),
             {
@@ -72,6 +73,7 @@ class AppointmentModel:
                 "slot_pos": slot_position,
                 "priority": priority_tier,
                 "is_emergency": is_emergency,
+                "visual_priority": visual_priority,
             },
         )
         row = result.mappings().one()
@@ -149,7 +151,8 @@ class AppointmentModel:
     async def get_queue(db: AsyncSession, session_id: UUID) -> List[Appointment]:
         """
         Get checked-in patients ordered for the queue.
-        ORDER: priority_tier DESC, visual_priority DESC, created_at ASC
+        ORDER: is_emergency DESC, priority_tier DESC, visual_priority DESC, created_at ASC
+        Emergency patients always come first regardless of other priorities.
         """
         result = await db.execute(
             text("""
@@ -157,6 +160,7 @@ class AppointmentModel:
                 WHERE session_id = :session_id
                   AND status = 'checked_in'
                 ORDER BY
+                    is_emergency DESC,
                     CASE priority_tier
                         WHEN 'CRITICAL' THEN 3
                         WHEN 'HIGH' THEN 2
@@ -171,13 +175,15 @@ class AppointmentModel:
 
     @staticmethod
     async def get_next_in_queue(db: AsyncSession, session_id: UUID) -> Optional[Appointment]:
-        """Get the top patient in the queue (first checked-in by priority)."""
+        """Get the top patient in the queue (first checked-in by priority).
+        Emergency patients always come first, then by priority tier, then visual_priority."""
         result = await db.execute(
             text("""
                 SELECT * FROM appointments
                 WHERE session_id = :session_id
                   AND status = 'checked_in'
                 ORDER BY
+                    is_emergency DESC,
                     CASE priority_tier
                         WHEN 'CRITICAL' THEN 3
                         WHEN 'HIGH' THEN 2
