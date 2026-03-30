@@ -57,6 +57,24 @@ def _build_detail_response(doctor: Doctor, user: User) -> DoctorDetailResponse:
     )
 
 
+async def _resolve_doctor(db: AsyncSession, doctor_id_or_user_id: str) -> Doctor:
+    """Resolve a UUID that could be either a doctors.id or a users.id to a Doctor object."""
+    try:
+        _uuid = UUID(doctor_id_or_user_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid doctor_id: '{doctor_id_or_user_id}'. Use list_doctors to get the real UUID.")
+    # Try as doctor_id first
+    doctor = await DoctorModel.get_by_id(db, _uuid)
+    if doctor:
+        return doctor
+    # Fall back: maybe it's a user_id
+    doctor = await DoctorModel.get_by_user_id(db, _uuid)
+    if doctor:
+        return doctor
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Doctor not found")
+
+
 def _build_session_response(session: Session) -> SessionResponse:
     capacity = (session.total_slots * session.max_patients_per_slot) - session.booked_count
     return SessionResponse(
@@ -80,15 +98,18 @@ def _build_session_response(session: Session) -> SessionResponse:
 @router.get("/", response_model=list[DoctorListItem])
 async def list_doctors(
     specialization: Optional[str] = Query(None, description="Filter by specialization (partial match)"),
+    include_unavailable: bool = Query(False, description="Include unavailable doctors (staff only)"),
     _current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Browse available doctors. Patients use this to find who to book with.
+    Browse doctors. Patients see only available doctors.
+    Staff can pass include_unavailable=true to see all doctors.
     Optional filter by specialization (e.g. 'cardio' matches 'Cardiology').
     """
+    only_available = not include_unavailable
     doctors = await DoctorModel.list_by_specialization(
-        db, specialization=specialization, only_available=True
+        db, specialization=specialization, only_available=only_available
     )
 
     results = []
@@ -107,21 +128,11 @@ async def get_doctor(
     _current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get full details for a specific doctor."""
-    doctor = await DoctorModel.get_by_id(db, UUID(doctor_id))
-    if not doctor:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Doctor not found",
-        )
-
+    """Get full details for a specific doctor. Accepts doctor_id or user_id."""
+    doctor = await _resolve_doctor(db, doctor_id)
     user = await UserModel.get_by_id(db, doctor.user_id)
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Doctor user profile not found",
-        )
-
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Doctor user profile not found")
     return _build_detail_response(doctor, user)
 
 
@@ -137,24 +148,19 @@ async def get_doctor_sessions(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    List a doctor's sessions.
+    List a doctor's sessions. Accepts doctor_id or user_id.
     - Default (include_all=false): active sessions with remaining capacity (for patient booking).
     - include_all=true: ALL sessions any status (for doctor dashboard).
     """
-    doctor = await DoctorModel.get_by_id(db, UUID(doctor_id))
-    if not doctor:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Doctor not found",
-        )
+    doctor = await _resolve_doctor(db, doctor_id)
 
     if include_all:
         sessions = await SessionModel.get_all_sessions(
-            db, doctor_id=UUID(doctor_id), date_from=date_from, date_to=date_to,
+            db, doctor_id=doctor.id, date_from=date_from, date_to=date_to,
         )
     else:
         sessions = await SessionModel.get_available_sessions(
-            db, doctor_id=UUID(doctor_id), date_from=date_from, date_to=date_to,
+            db, doctor_id=doctor.id, date_from=date_from, date_to=date_to,
         )
 
     return [_build_session_response(s) for s in sessions]
@@ -170,12 +176,9 @@ async def get_all_doctor_sessions(
     _current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """All sessions for a doctor (active, completed, cancelled) — for doctor dashboard."""
-    doctor = await DoctorModel.get_by_id(db, UUID(doctor_id))
-    if not doctor:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Doctor not found")
-
+    """All sessions for a doctor (active, completed, cancelled) — for doctor dashboard. Accepts doctor_id or user_id."""
+    doctor = await _resolve_doctor(db, doctor_id)
     sessions = await SessionModel.get_all_sessions(
-        db, doctor_id=UUID(doctor_id), date_from=date_from, date_to=date_to,
+        db, doctor_id=doctor.id, date_from=date_from, date_to=date_to,
     )
     return [_build_session_response(s) for s in sessions]

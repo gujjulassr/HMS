@@ -19,7 +19,7 @@ from fastapi.security import OAuth2PasswordBearer
 from dependencies import get_current_user
 from go.models.user import User
 from api.schemas.chat_schemas import ChatMessageRequest, ChatMessageResponse
-from go.services.chat_agent import run_chat, clear_conversation
+from go.services.chat_agent import run_chat, clear_conversation, get_conversation_history
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -84,6 +84,15 @@ async def send_message(
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Chat service error: {str(e)}")
+
+
+@router.get("/history")
+async def get_chat_history(
+    user: User = Depends(get_current_user),
+):
+    """Retrieve the user's conversation history from server-side storage."""
+    messages = await get_conversation_history(str(user.id))
+    return {"messages": messages}
 
 
 @router.post("/clear")

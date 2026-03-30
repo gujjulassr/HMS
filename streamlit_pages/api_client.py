@@ -63,6 +63,7 @@ def _request(method: str, url: str, **kwargs) -> httpx.Response:
     """
     kwargs.setdefault("headers", _headers())
     kwargs.setdefault("timeout", TIMEOUT)
+    kwargs.setdefault("follow_redirects", True)
     r = httpx.request(method, url, **kwargs)
     if r.status_code == 401 and _try_refresh():
         # Refresh worked — retry with new token
@@ -703,6 +704,15 @@ def chat_send_message(message: str, patient_context: str = "") -> dict:
     if r.status_code >= 400:
         _raise_api_error(r)
     return r.json()
+
+
+def chat_history() -> list:
+    """GET /chat/history — Retrieve conversation history from server."""
+    r = _request("GET", f"{BASE_URL}/chat/history")
+    if r.status_code >= 400:
+        return []
+    data = r.json()
+    return data.get("messages", [])
 
 
 def chat_clear() -> dict:

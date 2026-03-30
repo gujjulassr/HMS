@@ -34,6 +34,7 @@ apscheduler==3.10.4
 
 # ─── Frontend ─────────────────────────────────────────────
 streamlit==1.40.0
+audio-recorder-streamlit==0.0.10
 
 # ─── Utilities ────────────────────────────────────────────
 python-dotenv==1.0.1

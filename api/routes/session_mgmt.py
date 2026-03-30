@@ -740,10 +740,13 @@ async def create_session(
     else:
         raise HTTPException(status_code=400, detail="doctor_id is required for non-doctor users")
 
-    # Verify doctor exists
+    # Verify doctor exists (try as doctor_id first, then as user_id)
     doctor = await DoctorModel.get_by_id(db, doctor_id)
     if not doctor:
+        doctor = await DoctorModel.get_by_user_id(db, doctor_id)
+    if not doctor:
         raise HTTPException(status_code=404, detail="Doctor not found")
+    doctor_id = doctor.id  # ensure we use the real doctor_id going forward
 
     # Parse date and times
     try:

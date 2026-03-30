@@ -266,8 +266,9 @@ async def cancel_appointment(
 
     # ── Step 3: Calculate penalty ──
     # Use the actual slot time, not session start time
+    # Slot-0 emergency entries have no scheduled time — skip risk penalty
     session = await SessionModel.get_by_id(db, appointment.session_id)
-    if session:
+    if session and appointment.slot_number > 0:
         slot_start_minutes = (
             session.start_time.hour * 60 + session.start_time.minute
             + (appointment.slot_number - 1) * session.slot_duration_minutes
@@ -281,7 +282,7 @@ async def cancel_appointment(
     else:
         hours_before = 0
 
-    risk_delta = calculate_risk_delta(hours_before)
+    risk_delta = 0.0 if appointment.slot_number == 0 else calculate_risk_delta(hours_before)
 
     # ── Step 4: Cancel ──
     await AppointmentModel.update_status(db, appointment_id, "cancelled")
@@ -302,8 +303,8 @@ async def cancel_appointment(
         reason=reason,
     )
 
-    # ── Step 7: Decrement session booked_count ──
-    if session:
+    # ── Step 7: Decrement session booked_count (skip for slot-0 emergency entries) ──
+    if session and appointment.slot_number > 0:
         await SessionModel.update_booked_count(db, session.id, delta=-1)
 
     # ── Step 8: Auto-promote from waitlist ──

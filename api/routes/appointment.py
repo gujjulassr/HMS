@@ -487,8 +487,14 @@ async def emergency_book_route(
 
     Bypasses: rate limiting, risk scores, slot availability.
     """
-    session_id = UUID(body.session_id)
-    patient_id = UUID(body.patient_id)
+    try:
+        session_id = UUID(body.session_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail=f"Invalid session_id: '{body.session_id}'")
+    try:
+        patient_id = UUID(body.patient_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail=f"Invalid patient_id: '{body.patient_id}'")
 
     # Validate session
     session = await SessionModel.get_by_id_for_update(db, session_id)
@@ -517,7 +523,7 @@ async def emergency_book_route(
     )
     _next_pos = _pos_result.scalar() or 1
 
-    # Check if this patient already has an emergency appointment in this session
+    # Only block duplicate emergency entries (slot_number=0); allow emergency + regular to coexist
     _dup_check = await db.execute(
         _txt("SELECT id FROM appointments WHERE session_id = :sid AND patient_id = :pid "
              "AND slot_number = 0 AND status NOT IN ('cancelled', 'no_show')"),

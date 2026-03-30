@@ -19,7 +19,6 @@ Key patterns:
 """
 import streamlit as st
 import sys, os
-import base64
 
 sys.path.insert(0, os.path.dirname(__file__))
 from streamlit_pages import api_client as api
@@ -1519,10 +1518,12 @@ def page_doctor_dashboard():
     # Show any pending messages from previous action
     if "dd_msg" in st.session_state:
         msg = st.session_state.pop("dd_msg")
-        if msg.startswith("✅"):
-            st.success(msg)
-        else:
+        if msg.startswith("❌"):
             st.error(msg)
+        elif msg.startswith("✖") or msg.startswith("⚠️"):
+            st.warning(msg)
+        else:
+            st.success(msg)
 
     if can_act_today or can_add_patient:
         # Show all 5 columns but only enable relevant buttons
@@ -1999,7 +2000,7 @@ def page_doctor_dashboard():
                     row[6].write("—")
                 elif e_status == "in_progress":
                     ac1, ac2 = row[6].columns(2)
-                    if ac1.button("✅ Done", key=f"comp_{i}", type="primary"):
+                    if ac1.button("✅ Done", key=f"comp_{e_appt_id}", type="primary"):
                         try:
                             api.complete_appointment({"appointment_id": e_appt_id})
                             delay = _calc_and_update_delay(sid, s_start, dur, e_slot)
@@ -2015,8 +2016,8 @@ def page_doctor_dashboard():
                             st.rerun()
                     waiting_for_next = [e for e in all_q if e["status"] == "checked_in" and e["appointment_id"] != e_appt_id]
                     if not waiting_for_next:
-                        ac2.button("➡️ Next", key=f"compnx_{i}", disabled=True, help="No patients waiting")
-                    elif ac2.button("➡️ Next", key=f"compnx_{i}", help="Complete & call next"):
+                        ac2.button("➡️ Next", key=f"compnx_{e_appt_id}", disabled=True, help="No patients waiting")
+                    elif ac2.button("➡️ Next", key=f"compnx_{e_appt_id}", help="Complete & call next"):
                         try:
                             api.complete_appointment({"appointment_id": e_appt_id})
                             delay = _calc_and_update_delay(sid, s_start, dur, e_slot)
@@ -2036,13 +2037,13 @@ def page_doctor_dashboard():
                     has_in_progress = current_pat is not None
                     if has_in_progress:
                         ac1, ac2, ac3 = row[6].columns(3)
-                        if ac1.button("⚡", key=f"prio_{i}", help="Change priority"):
-                            st.session_state[f"show_prio_{i}"] = not st.session_state.get(f"show_prio_{i}", False)
+                        if ac1.button("⚡", key=f"prio_{e_appt_id}", help="Change priority"):
+                            st.session_state[f"show_prio_{e_appt_id}"] = not st.session_state.get(f"show_prio_{e_appt_id}", False)
                             st.rerun()
-                        if ac2.button("❌", key=f"canc_{i}", help="Cancel appointment"):
-                            st.session_state[f"show_cancel_{i}"] = not st.session_state.get(f"show_cancel_{i}", False)
+                        if ac2.button("❌", key=f"canc_{e_appt_id}", help="Cancel appointment"):
+                            st.session_state[f"show_cancel_{e_appt_id}"] = not st.session_state.get(f"show_cancel_{e_appt_id}", False)
                             st.rerun()
-                        if ac3.button("🚫", key=f"ns_{i}", help="No-show"):
+                        if ac3.button("🚫", key=f"ns_{e_appt_id}", help="No-show"):
                             if _mark_noshow(e_appt_id):
                                 st.session_state["dd_msg"] = f"✅ {e_name} marked no-show."
                                 st.rerun()
@@ -2051,7 +2052,7 @@ def page_doctor_dashboard():
                                 st.rerun()
                     else:
                         ac1, ac2, ac3, ac4 = row[6].columns(4)
-                        if ac1.button("📞", key=f"call_{i}", help="Call in"):
+                        if ac1.button("📞", key=f"call_{e_appt_id}", help="Call in"):
                             try:
                                 api.call_patient({"appointment_id": e_appt_id})
                                 st.session_state["dd_msg"] = f"✅ {e_name} called in!"
@@ -2059,13 +2060,13 @@ def page_doctor_dashboard():
                             except Exception as ex:
                                 st.session_state["dd_msg"] = f"❌ Call failed: {ex}"
                                 st.rerun()
-                        if ac2.button("⚡", key=f"prio_{i}", help="Change priority"):
-                            st.session_state[f"show_prio_{i}"] = not st.session_state.get(f"show_prio_{i}", False)
+                        if ac2.button("⚡", key=f"prio2_{e_appt_id}", help="Change priority"):
+                            st.session_state[f"show_prio_{e_appt_id}"] = not st.session_state.get(f"show_prio_{e_appt_id}", False)
                             st.rerun()
-                        if ac3.button("❌", key=f"canc_{i}", help="Cancel"):
-                            st.session_state[f"show_cancel_{i}"] = not st.session_state.get(f"show_cancel_{i}", False)
+                        if ac3.button("❌", key=f"canc2_{e_appt_id}", help="Cancel"):
+                            st.session_state[f"show_cancel_{e_appt_id}"] = not st.session_state.get(f"show_cancel_{e_appt_id}", False)
                             st.rerun()
-                        if ac4.button("🚫", key=f"ns_{i}", help="No-show"):
+                        if ac4.button("🚫", key=f"ns2_{e_appt_id}", help="No-show"):
                             if _mark_noshow(e_appt_id):
                                 st.session_state["dd_msg"] = f"✅ {e_name} marked no-show."
                                 st.rerun()
@@ -2074,13 +2075,13 @@ def page_doctor_dashboard():
                                 st.rerun()
                 elif e_status == "booked":
                     ac1, ac2, ac3 = row[6].columns(3)
-                    if ac1.button("⚡", key=f"prio_{i}", help="Change priority"):
-                        st.session_state[f"show_prio_{i}"] = not st.session_state.get(f"show_prio_{i}", False)
+                    if ac1.button("⚡", key=f"prio3_{e_appt_id}", help="Change priority"):
+                        st.session_state[f"show_prio_{e_appt_id}"] = not st.session_state.get(f"show_prio_{e_appt_id}", False)
                         st.rerun()
-                    if ac2.button("❌", key=f"canc_{i}", help="Cancel appointment"):
-                        st.session_state[f"show_cancel_{i}"] = not st.session_state.get(f"show_cancel_{i}", False)
+                    if ac2.button("❌", key=f"canc3_{e_appt_id}", help="Cancel appointment"):
+                        st.session_state[f"show_cancel_{e_appt_id}"] = not st.session_state.get(f"show_cancel_{e_appt_id}", False)
                         st.rerun()
-                    if ac3.button("🚫", key=f"bns_{i}", help="No-show"):
+                    if ac3.button("🚫", key=f"bns_{e_appt_id}", help="No-show"):
                         if _mark_noshow(e_appt_id):
                             st.session_state["dd_msg"] = f"✅ {e_name} marked no-show."
                             st.rerun()
@@ -2091,15 +2092,15 @@ def page_doctor_dashboard():
                     row[6].write("—")
 
                 # ── Priority edit (expanded inline when toggled) ──
-                if is_active_session and st.session_state.get(f"show_prio_{i}", False) and e_status in ("checked_in", "booked"):
+                if is_active_session and st.session_state.get(f"show_prio_{e_appt_id}", False) and e_status in ("checked_in", "booked"):
                     with st.container():
-                        with st.form(f"prioform_{i}", clear_on_submit=True):
+                        with st.form(f"prioform_{e_appt_id}", clear_on_submit=True):
                             pc1, pc2, pc3, pc4 = st.columns([1.5, 1, 2, 1])
                             tier_opts = ["NORMAL", "HIGH", "CRITICAL"]
                             cur_idx = tier_opts.index(e_prio) if e_prio in tier_opts else 0
-                            new_tier = pc1.selectbox("Tier", tier_opts, index=cur_idx, key=f"pt_{i}")
-                            new_emerg = pc2.checkbox("Emergency", value=e_emerg, key=f"em_{i}")
-                            esc_reason = pc3.text_input("Reason", key=f"er_{i}")
+                            new_tier = pc1.selectbox("Tier", tier_opts, index=cur_idx, key=f"pt_{e_appt_id}")
+                            new_emerg = pc2.checkbox("Emergency", value=e_emerg, key=f"em_{e_appt_id}")
+                            esc_reason = pc3.text_input("Reason", key=f"er_{e_appt_id}")
                             if pc4.form_submit_button("Save"):
                                 try:
                                     api.escalate_priority({
@@ -2108,32 +2109,34 @@ def page_doctor_dashboard():
                                         "is_emergency": new_emerg,
                                         "reason": esc_reason or "Updated by doctor",
                                     })
-                                    st.session_state[f"show_prio_{i}"] = False
+                                    st.session_state[f"show_prio_{e_appt_id}"] = False
                                     st.session_state["dd_msg"] = f"✅ Priority updated for {e_name}."
                                     st.rerun()
                                 except Exception as ex:
-                                    st.error(f"{ex}")
+                                    st.session_state["dd_msg"] = f"❌ Priority update failed: {ex}"
+                                    st.session_state[f"show_prio_{e_appt_id}"] = False
+                                    st.rerun()
 
                 # ── Cancel confirmation (expanded inline when toggled) ──
-                if is_active_session and st.session_state.get(f"show_cancel_{i}", False) and e_status in ("checked_in", "booked"):
+                if is_active_session and st.session_state.get(f"show_cancel_{e_appt_id}", False) and e_status in ("checked_in", "booked"):
                     with st.container():
                         st.warning(f"Cancel appointment for **{e_name}** (Slot {slot_label} at {e_time})?")
                         cc1, cc2, cc3 = st.columns([2, 1, 1])
-                        cancel_reason = cc1.text_input("Reason", key=f"cr_{i}", placeholder="e.g. Patient request, Emergency reschedule")
-                        if cc2.button("Confirm Cancel", key=f"cc_{i}", type="primary"):
+                        cancel_reason = cc1.text_input("Reason", key=f"cr_{e_appt_id}", placeholder="e.g. Patient request, Emergency reschedule")
+                        if cc2.button("Confirm Cancel", key=f"cc_{e_appt_id}", type="primary"):
                             try:
                                 api.staff_cancel_appointment({
                                     "appointment_id": e_appt_id,
                                     "reason": cancel_reason or "Cancelled by doctor",
                                 })
-                                st.session_state[f"show_cancel_{i}"] = False
+                                st.session_state[f"show_cancel_{e_appt_id}"] = False
                                 st.session_state["dd_msg"] = f"✅ {e_name}'s appointment cancelled."
                                 st.rerun()
                             except Exception as ex:
                                 st.session_state["dd_msg"] = f"❌ Cancel failed: {ex}"
                                 st.rerun()
-                        if cc3.button("Keep", key=f"ck_{i}"):
-                            st.session_state[f"show_cancel_{i}"] = False
+                        if cc3.button("Keep", key=f"ck_{e_appt_id}"):
+                            st.session_state[f"show_cancel_{e_appt_id}"] = False
                             st.rerun()
 
 
@@ -2524,6 +2527,16 @@ def page_staff_session():
     if tc2.button("🔄 Refresh", key="refresh_nurse", use_container_width=True):
         st.rerun()
 
+    # Show success/error from previous action
+    if "dd_msg" in st.session_state:
+        _dd = st.session_state.pop("dd_msg")
+        if _dd.startswith("❌"):
+            st.error(_dd)
+        elif _dd.startswith("✖") or _dd.startswith("⚠️"):
+            st.warning(_dd)
+        else:
+            st.success(_dd)
+
     # ── Step 1: Department → Doctor → Session picker ──
     session_id = _smart_session_picker("staff_sp")
     if not session_id:
@@ -2558,6 +2571,7 @@ def page_staff_session():
     default_dur = q.get("slot_duration_minutes", 15)
     session_start = q.get("session_start_time", "")
     session_end = q.get("session_end_time", "")
+    nurse_sess_status = q.get("session_status", "active")
 
     # ── Gather all patients ──
     all_entries = q.get("queue", [])
@@ -2579,9 +2593,28 @@ def page_staff_session():
     all_patients.extend(noshow_entries)
 
     # ── Header bar ──
-    ref_col, ts_col = st.columns([1, 3])
+    ref_col, deact_col, ts_col = st.columns([1, 1, 3])
     if ref_col.button("🔄 Refresh", key="staff_refresh"):
         st.rerun()
+    # Deactivate / Activate toggle for current session
+    if nurse_sess_status == "active":
+        if deact_col.button("🔴 Deactivate", key="nurse_deact_sess", use_container_width=True):
+            try:
+                api.deactivate_session({"session_id": session_id})
+                st.session_state["dd_msg"] = "✅ Session deactivated."
+                st.rerun()
+            except Exception as e:
+                st.session_state["dd_msg"] = f"❌ {e}"
+                st.rerun()
+    elif nurse_sess_status == "inactive":
+        if deact_col.button("🟢 Activate", key="nurse_act_sess", use_container_width=True):
+            try:
+                api.activate_session({"session_id": session_id})
+                st.session_state["dd_msg"] = "✅ Session activated."
+                st.rerun()
+            except Exception as e:
+                st.session_state["dd_msg"] = f"❌ {e}"
+                st.rerun()
     ts_col.caption(f"**{doctor_name}**  •  {session_date_str}  •  {session_start[:5]}–{session_end[:5]}  •  Updated {datetime.now().strftime('%I:%M %p')}")
 
     if is_past:
@@ -2644,10 +2677,11 @@ def page_staff_session():
         if qa1.button(f"🔔 Call {next_name}", type="primary", use_container_width=True, key="call_next_top"):
             try:
                 r = api.call_patient({"appointment_id": waiting[0]["appointment_id"]})
-                st.success(r["message"])
+                st.session_state["dd_msg"] = r.get("message", f"✅ {next_name} called in!")
                 st.rerun()
             except Exception as e:
-                st.error(f"{e}")
+                st.session_state["dd_msg"] = f"❌ {e}"
+                st.rerun()
     elif current_patient:
         qa1.info(f"🔄 {(current_patient.get('patient_name') or 'Patient')} is with doctor")
 
@@ -2657,10 +2691,11 @@ def page_staff_session():
         if qa2.button(f"🚨 Call {emg_name}", type="primary", use_container_width=True, key="call_emg_top"):
             try:
                 r = api.call_patient({"appointment_id": emergency_waiting[0]["appointment_id"]})
-                st.success(r["message"])
+                st.session_state["dd_msg"] = r.get("message", f"🚨 {emg_name} called in!")
                 st.rerun()
             except Exception as e:
-                st.error(f"{e}")
+                st.session_state["dd_msg"] = f"❌ {e}"
+                st.rerun()
     elif not is_future and emergency_waiting and current_patient:
         qa2.warning(f"🚨 {len(emergency_waiting)} emergency waiting")
 
@@ -2669,10 +2704,11 @@ def page_staff_session():
         if qa3.button("⚠️ Mark Unarrived No-Show", use_container_width=True, key="bulk_noshow"):
             try:
                 r = api.mark_no_shows({"session_id": session_id})
-                st.success(r["message"])
+                st.session_state["dd_msg"] = r.get("message", "⚠️ No-shows marked.")
                 st.rerun()
             except Exception as e:
-                st.error(f"{e}")
+                st.session_state["dd_msg"] = f"❌ {e}"
+                st.rerun()
 
     # Add patient — separate section below patient list
     if not is_past:
@@ -2708,9 +2744,6 @@ def page_staff_session():
             pass
         return "—"
 
-    # Session status from queue API
-    nurse_sess_status = q.get("session_status", "active")
-
     # Helper: is a booked slot in the past?
     # If the session is still active, slot time being past does NOT block actions.
     # Doctor controls when session ends — nurse can check in patients anytime while active.
@@ -2732,8 +2765,16 @@ def page_staff_session():
             return False
 
     # ── Render each patient ──
+    # Sort: status group first, then within checked_in: emergency first, then priority (CRITICAL>HIGH>NORMAL), then visual_priority desc
     status_order = {"in_progress": 0, "checked_in": 1, "booked": 2, "completed": 3, "no_show": 4, "cancelled": 5}
-    sorted_patients = sorted(all_patients, key=lambda e: (status_order.get(e["status"], 9), e.get("slot_number", 0)))
+    _prio_order = {"CRITICAL": 0, "HIGH": 1, "NORMAL": 2}
+    sorted_patients = sorted(all_patients, key=lambda e: (
+        status_order.get(e["status"], 9),
+        0 if e.get("is_emergency") else 1,
+        _prio_order.get(e.get("priority_tier", "NORMAL"), 2),
+        -(e.get("visual_priority", 5)),
+        e.get("slot_number", 0),
+    ))
 
     for entry in sorted_patients:
         status = entry["status"]
@@ -2818,7 +2859,8 @@ def page_staff_session():
         step_html += '</div>'
 
         # ── Expander header — time-first, slot secondary ──
-        header = f"{icon} **{name}**{emg}  —  {slot_t} (Slot {slot})  •  {label}{wait_str}"
+        _slot_display = "🚨 Emergency" if int(slot) == 0 else f"{slot_t} (Slot {slot})"
+        header = f"{icon} **{name}**{emg}  —  {_slot_display}  •  {label}{wait_str}"
 
         with st.expander(header, expanded=(status == "in_progress")):
             # Step tracker
@@ -2833,7 +2875,7 @@ def page_staff_session():
                 f'<span>📆 <strong>{appt_day}, {appt_date_display}</strong></span>'
                 f'<span>🕐 <strong>{slot_t}</strong> ({dur_min} min)</span>'
                 f'<span>🩺 <strong>{doctor_name}</strong></span>'
-                f'<span>🎫 Slot <strong>#{slot}</strong></span>'
+                f'<span>🎫 {"<strong>Emergency</strong>" if int(slot) == 0 else f"Slot <strong>#{slot}</strong>"}</span>'
                 f'</div></div>',
                 unsafe_allow_html=True,
             )
@@ -2875,10 +2917,13 @@ def page_staff_session():
 
             # ── Priority / Urgency / Duration row ──
             _pill = "background:#e2e8f0;border-radius:16px;padding:4px 12px;font-size:0.85em;color:#1e293b"
+            _emg_pill = "background:#fee2e2;border-radius:16px;padding:4px 12px;font-size:0.85em;color:#991b1b"
+            _prio_pill = _emg_pill if priority == "CRITICAL" else ("background:#fff7ed;border-radius:16px;padding:4px 12px;font-size:0.85em;color:#9a3412" if priority == "HIGH" else _pill)
             st.markdown(
                 f'<div style="display:flex;gap:12px;margin:8px 0;flex-wrap:wrap">'
-                f'<div style="{_pill}">Priority: <strong>{priority}</strong></div>'
-                f'<div style="{_pill}">Urgency: <strong>{urgency}/10</strong></div>'
+                f'<div style="{_prio_pill}">Priority: <strong>{priority}</strong></div>'
+                + (f'<div style="{_emg_pill}">🚨 <strong>EMERGENCY</strong></div>' if entry.get("is_emergency") else '')
+                + f'<div style="{_pill}">Urgency: <strong>{urgency}/10</strong></div>'
                 f'<div style="{_pill}">Duration: <strong>{dur_min}m</strong></div>'
                 f'<div style="{_pill}">Queue Pos: <strong>{entry.get("slot_position", "—")}</strong></div>'
                 f'</div>',
@@ -2900,6 +2945,7 @@ def page_staff_session():
             if pending:
                 st.session_state.pop(action_key, None)
                 try:
+                    _dd_msg = ""
                     if pending == "checkin":
                         vp_val = st.session_state.get(f"vp_{appt_id}", 5)
                         dur_val = st.session_state.get(f"dur_{appt_id}", default_dur)
@@ -2914,40 +2960,59 @@ def page_staff_session():
                         if dur_val != default_dur:
                             payload["duration_minutes"] = dur_val
                         r = api.checkin_patient(payload)
-                        st.success(f"✅ {name} checked in — #{r['queue_position']}")
+                        _dd_msg = f"✅ {name} checked in — #{r['queue_position']}"
                     elif pending == "cancel":
                         r = api.staff_cancel_appointment({"appointment_id": appt_id, "reason": "Cancelled by nurse"})
-                        st.warning(f"✖ {name} cancelled.")
+                        _dd_msg = f"✖ {name} cancelled."
                     elif pending == "noshow":
                         r = api.mark_no_shows({"session_id": session_id})
-                        st.success(f"⚠️ No-show recorded.")
+                        _dd_msg = f"⚠️ No-show recorded."
                     elif pending == "call":
                         r = api.call_next({"session_id": session_id})
-                        st.success(r["message"])
+                        _dd_msg = r.get("message", f"✅ Calling next patient")
                     elif pending == "undo_checkin":
                         r = api.undo_checkin({"appointment_id": appt_id})
-                        st.success(f"↩ {name} moved back to booked.")
+                        _dd_msg = f"↩ {name} moved back to booked."
                     elif pending == "complete":
                         notes_val = st.session_state.get(f"notes_{appt_id}", "")
                         r = api.complete_appointment({"appointment_id": appt_id, "notes": notes_val})
-                        st.success(r["message"])
+                        _dd_msg = r.get("message", f"✅ {name} completed.")
                     elif pending == "complete_retro":
                         r = api.call_next({"session_id": session_id})
                         r2 = api.complete_appointment({"appointment_id": appt_id, "notes": "Completed retroactively by nurse"})
-                        st.success(f"✔️ {name} marked as completed.")
+                        _dd_msg = f"✔️ {name} marked as completed."
                     elif pending == "back_to_queue":
                         r = api.undo_send({"session_id": session_id})
-                        st.success(f"↩ {name} sent back to waiting.")
+                        _dd_msg = f"↩ {name} sent back to waiting."
                     elif pending == "undo_complete":
                         r = api.undo_complete({"appointment_id": appt_id})
-                        st.success(f"↩ {name} moved back to with doctor.")
+                        _dd_msg = f"↩ {name} moved back to with doctor."
                     elif pending == "undo_noshow":
                         r = api.undo_noshow({"appointment_id": appt_id})
-                        st.success(f"↩ {name} restored to booked.")
+                        _dd_msg = f"↩ {name} restored to booked."
+                    elif pending == "remove_emergency":
+                        # Slot 0 entries only exist because of emergency — cancel them entirely
+                        _slot = entry.get("slot_number", 0)
+                        if _slot == 0:
+                            r = api.staff_cancel_appointment({"appointment_id": appt_id,
+                                                               "reason": "Emergency removed — entry cancelled"})
+                            _dd_msg = f"✅ {name} emergency entry cancelled."
+                        else:
+                            r = api.escalate_priority({"appointment_id": appt_id, "is_emergency": False,
+                                                        "reason": "Emergency flag removed by staff"})
+                            _dd_msg = f"✅ {name} removed from emergency status."
+                    elif pending == "set_emergency":
+                        r = api.escalate_priority({"appointment_id": appt_id, "is_emergency": True,
+                                                    "priority_tier": "CRITICAL",
+                                                    "reason": "Marked emergency by staff"})
+                        _dd_msg = f"🚨 {name} marked as emergency."
+                    if _dd_msg:
+                        st.session_state["dd_msg"] = _dd_msg
                     import time as _t; _t.sleep(0.5)
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Action failed: {e}")
+                    st.session_state["dd_msg"] = f"❌ Action failed: {e}"
+                    st.rerun()
 
             # ── BOOKED ──
             if status == "booked":
@@ -3033,32 +3098,36 @@ def page_staff_session():
                                 except Exception as e:
                                     st.error(f"Failed: {e}")
 
-                    if entry.get("is_emergency"):
-                        bc1, bc2, bc3 = st.columns(3)
-                        if not current_patient:
-                            if bc1.button("🔔 Call to Doctor", key=f"btn_call_{appt_id}", type="primary", use_container_width=True):
-                                st.session_state[action_key] = "call"
-                                st.rerun()
-                        else:
-                            bc1.info("🔄 Complete current patient first")
-                        if bc2.button("✖ Cancel", key=f"btn_cx_{appt_id}", use_container_width=True):
-                            st.session_state[action_key] = "cancel"
-                            st.rerun()
-                        if bc3.button("🔀 Reassign", key=f"btn_ra_{appt_id}", use_container_width=True):
-                            st.session_state[f"reassign_{appt_id}"] = True
+                    _is_emg = entry.get("is_emergency", False)
+                    _is_slot0 = entry.get("slot_number", 0) == 0
+                    bc1, bc2, bc3, bc4 = st.columns(4)
+                    # Call to Doctor
+                    if not current_patient:
+                        if bc1.button("🔔 Call", key=f"btn_call_{appt_id}", type="primary", use_container_width=True):
+                            st.session_state[action_key] = "call"
                             st.rerun()
                     else:
-                        bc1, bc2, bc3 = st.columns(3)
-                        if not current_patient:
-                            if bc1.button("🔔 Call to Doctor", key=f"btn_call_{appt_id}", type="primary", use_container_width=True):
-                                st.session_state[action_key] = "call"
-                                st.rerun()
-                        else:
-                            bc1.info("🔄 Complete current patient first")
-                        if bc2.button("↩ Undo Check-in", key=f"btn_uci_{appt_id}", use_container_width=True):
+                        bc1.info("🔄 Doctor busy")
+                    # Emergency toggle — show Remove if emergency, Set if not
+                    if _is_emg:
+                        if bc2.button("🚫 Remove Emergency", key=f"btn_remg_{appt_id}", use_container_width=True):
+                            st.session_state[action_key] = "remove_emergency"
+                            st.rerun()
+                    else:
+                        if bc2.button("🚨 Set Emergency", key=f"btn_semg_{appt_id}", use_container_width=True):
+                            st.session_state[action_key] = "set_emergency"
+                            st.rerun()
+                    # Cancel
+                    if bc3.button("✖ Cancel", key=f"btn_cx_{appt_id}", use_container_width=True):
+                        st.session_state[action_key] = "cancel"
+                        st.rerun()
+                    # Undo check-in (only for regular slots, not slot 0 emergency entries)
+                    if not _is_slot0:
+                        if bc4.button("↩ Undo", key=f"btn_uci_{appt_id}", use_container_width=True):
                             st.session_state[action_key] = "undo_checkin"
                             st.rerun()
-                        if bc3.button("🔀 Reassign", key=f"btn_ra_{appt_id}", use_container_width=True):
+                    else:
+                        if bc4.button("🔀 Reassign", key=f"btn_ra_{appt_id}", use_container_width=True):
                             st.session_state[f"reassign_{appt_id}"] = True
                             st.rerun()
 
@@ -3164,11 +3233,12 @@ def page_staff_session():
                                         "target_session_id": sel_sess["session_id"],
                                         "target_slot_number": t_slot,
                                     })
-                                    st.success(r["message"])
+                                    st.session_state["dd_msg"] = r.get("message", f"✅ {name} reassigned.")
                                     st.session_state.pop(f"reassign_{appt_id}", None)
                                     st.rerun()
                                 except Exception as e:
-                                    st.error(f"Reassign failed: {e}")
+                                    st.session_state["dd_msg"] = f"❌ Reassign failed: {e}"
+                                    st.rerun()
                             if fc2.form_submit_button("Cancel"):
                                 st.session_state.pop(f"reassign_{appt_id}", None)
                                 st.rerun()
@@ -5134,6 +5204,18 @@ def page_chatbot():
     if "chat_mode" not in st.session_state:
         st.session_state.chat_mode = ""  # "", "book", "chat"
 
+    # ── Restore chat history from server on fresh page load ──
+    if not st.session_state.chat_messages and "chat_history_loaded" not in st.session_state:
+        st.session_state.chat_history_loaded = True
+        try:
+            server_history = api.chat_history()
+            if server_history:
+                st.session_state.chat_messages = server_history
+                st.session_state.chat_form_done = True
+                st.session_state.chat_mode = "chat"
+        except Exception:
+            pass
+
     # ── MODE SELECTION (nurse/admin only) ──
     if role in ("nurse", "admin") and st.session_state.chat_mode == "":
         _show_mode_selection(role)
@@ -5369,12 +5451,35 @@ def _show_admin_intake_form():
 
 
 def _autoplay_audio(audio_bytes: bytes):
-    """Inject an auto-playing HTML audio element for TTS output."""
-    b64 = base64.b64encode(audio_bytes).decode()
-    st.markdown(
-        f'<audio autoplay src="data:audio/mpeg;base64,{b64}"></audio>',
-        unsafe_allow_html=True,
-    )
+    """Queue TTS audio for playback after next rerun (survives st.rerun cycle)."""
+    st.session_state._pending_tts_audio = audio_bytes
+
+
+def _clean_text_for_tts(text: str) -> str:
+    """Strip markdown formatting, code blocks, and special chars for natural TTS."""
+    import re
+    # Remove code blocks (```...```)
+    text = re.sub(r'```[\s\S]*?```', ' code block omitted ', text)
+    # Remove inline code (`...`)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # Remove markdown bold/italic (**text**, *text*, __text__, _text_)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'_(.+?)_', r'\1', text)
+    # Remove markdown headers (# ## ###)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Remove markdown links [text](url) → text
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    # Remove bullet points (- or *)
+    text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
+    # Remove numbered lists (1. 2. etc)
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    # Remove emoji (common unicode ranges)
+    text = re.sub(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F900-\U0001F9FF\U00002702-\U000027B0\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF]', '', text)
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 def _send_and_reply(prompt: str, speak: bool = False):
@@ -5406,11 +5511,14 @@ def _send_and_reply(prompt: str, speak: bool = False):
         # Text-to-Speech: convert reply to audio and auto-play
         if speak and reply and not reply.startswith("Error"):
             try:
-                with st.spinner("Speaking..."):
-                    tts_audio = api.chat_tts(reply)
-                    _autoplay_audio(tts_audio)
-            except Exception:
-                pass  # TTS failure is non-critical, text reply is still shown
+                tts_text = _clean_text_for_tts(reply)
+                if tts_text:
+                    voice = st.session_state.get("tts_voice", "alloy")
+                    with st.spinner("🔊 Speaking..."):
+                        tts_audio = api.chat_tts(tts_text, voice=voice)
+                        _autoplay_audio(tts_audio)
+            except Exception as e:
+                st.caption(f"⚠️ Voice playback unavailable")
 
 
 def _show_chat_interface():
@@ -5421,6 +5529,8 @@ def _show_chat_interface():
     # Init voice mode toggle
     if "voice_mode" not in st.session_state:
         st.session_state.voice_mode = False
+    if "tts_voice" not in st.session_state:
+        st.session_state.tts_voice = "alloy"
 
     # Toolbar
     col1, col2, col3, col4 = st.columns([5, 1.5, 1.5, 2])
@@ -5446,6 +5556,7 @@ def _show_chat_interface():
             st.session_state.chat_mode = ""
             st.session_state.chat_context_sent = False
             st.session_state.voice_mode = False
+            st.session_state.pop("chat_history_loaded", None)
             st.rerun()
     with col4:
         if st.session_state.chat_mode == "book" and role in ("nurse", "admin"):
@@ -5453,12 +5564,29 @@ def _show_chat_interface():
                 st.session_state.chat_form_done = False
                 st.rerun()
 
+    # ── Voice settings in sidebar when voice mode is on ──
+    if st.session_state.voice_mode:
+        with st.sidebar:
+            st.markdown("#### 🔊 Voice Settings")
+            _voices = {"Alloy (neutral)": "alloy", "Echo (male)": "echo", "Fable (British)": "fable",
+                        "Onyx (deep male)": "onyx", "Nova (female)": "nova", "Shimmer (soft female)": "shimmer"}
+            _voice_labels = list(_voices.keys())
+            _current_voice = st.session_state.get("tts_voice", "alloy")
+            _current_idx = list(_voices.values()).index(_current_voice) if _current_voice in _voices.values() else 0
+            _selected = st.selectbox("Voice", _voice_labels, index=_current_idx, key="voice_select")
+            st.session_state.tts_voice = _voices[_selected]
+
     st.divider()
 
     # Display message history (local UI copy)
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+
+    # ── Play queued TTS audio (survives st.rerun cycle) ──
+    if "_pending_tts_audio" in st.session_state and st.session_state._pending_tts_audio:
+        _tts_bytes = st.session_state.pop("_pending_tts_audio")
+        st.audio(_tts_bytes, format="audio/mpeg", autoplay=True)
 
     # ── Mic input (voice mode) ──
     if HAS_AUDIO_RECORDER and st.session_state.voice_mode:
@@ -5471,20 +5599,31 @@ def _show_chat_interface():
             pause_threshold=2.0,
             key="voice_recorder",
         )
-        if audio_bytes:
+        if audio_bytes and len(audio_bytes) > 100:
             # Avoid re-processing the same audio on Streamlit reruns
-            audio_hash = hash(audio_bytes)
+            import hashlib
+            audio_hash = hashlib.md5(audio_bytes).hexdigest()
             if audio_hash != st.session_state.get("_last_audio_hash"):
                 st.session_state._last_audio_hash = audio_hash
-                with st.spinner("Transcribing your speech..."):
+                # Detect format from header bytes
+                if audio_bytes[:4] == b'RIFF':
+                    _fname = "voice.wav"
+                elif audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
+                    _fname = "voice.mp3"
+                elif audio_bytes[:4] == b'OggS':
+                    _fname = "voice.ogg"
+                else:
+                    _fname = "voice.webm"  # audio_recorder default
+                with st.spinner("🎙️ Transcribing..."):
                     try:
-                        result = api.chat_transcribe(audio_bytes, filename="voice.wav")
+                        result = api.chat_transcribe(audio_bytes, filename=_fname)
                         transcribed_text = result.get("text", "").strip()
                     except Exception as e:
                         st.error(f"Could not transcribe audio: {e}")
                         transcribed_text = ""
 
                 if transcribed_text:
+                    st.caption(f"🗣️ *\"{transcribed_text}\"*")
                     _send_and_reply(transcribed_text, speak=True)
                     st.rerun()
 

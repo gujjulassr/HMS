@@ -257,11 +257,11 @@ async def checkin_patient(
         "checked_in_at": datetime.now(),
         "checked_in_by": user.id,
     }
-    if body.priority_tier:
+    if body.priority_tier is not None:
         extra["priority_tier"] = body.priority_tier
-    if body.is_emergency:
-        extra["is_emergency"] = True
-        if not body.priority_tier or body.priority_tier == "NORMAL":
+    if body.is_emergency is not None:
+        extra["is_emergency"] = body.is_emergency
+        if body.is_emergency and (not body.priority_tier or body.priority_tier == "NORMAL"):
             extra["priority_tier"] = "CRITICAL"
     if body.duration_minutes is not None:
         extra["duration_minutes"] = body.duration_minutes
@@ -531,11 +531,33 @@ async def escalate_priority(
     db: AsyncSession = Depends(get_db),
 ):
     """Doctor or staff changes a patient's priority tier, visual priority, or emergency flag."""
-    appt = await AppointmentModel.get_by_id(db, UUID(body.appointment_id))
+    try:
+        _appt_uuid = UUID(body.appointment_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail=f"Invalid appointment_id: '{body.appointment_id}'. Use get_queue to get real appointment UUIDs.")
+    appt = await AppointmentModel.get_by_id(db, _appt_uuid)
     if not appt:
-        raise HTTPException(status_code=404, detail="Appointment not found")
+        raise HTTPException(status_code=404, detail="Appointment not found. Use get_queue(session_id) to get real appointment IDs.")
     if appt.status in ("completed", "cancelled", "no_show"):
         raise HTTPException(status_code=400, detail=f"Cannot escalate: status is '{appt.status}'")
+
+    # Slot-0 entries only exist for emergencies — removing emergency = cancel the entry
+    if body.is_emergency is False and appt.slot_number == 0 and appt.is_emergency:
+        await AppointmentModel.update_status(db, appt.id, "cancelled")
+        await db.commit()
+        await _try_audit(
+            db, action="escalate_priority", performed_by_user_id=user.id,
+            appointment_id=appt.id, patient_id=appt.patient_id,
+            metadata={"action": "emergency_slot0_cancelled", "reason": body.reason},
+        )
+        return {
+            "status": "cancelled",
+            "message": f"Emergency entry cancelled (slot 0 entries only exist for emergencies). {body.reason}",
+            "appointment_id": str(appt.id),
+            "priority_tier": appt.priority_tier,
+            "visual_priority": appt.visual_priority,
+            "is_emergency": False,
+        }
 
     updates = {}
     if body.priority_tier is not None:
