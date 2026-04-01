@@ -28,7 +28,11 @@ async def lifespan(app: FastAPI):
     Shutdown: close connection pool (releases DB connections)
     """
     await init_db()
-    await mongo_ensure_indexes()
+    try:
+        await mongo_ensure_indexes()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"[MongoDB] Could not connect on startup (chat will retry lazily): {e}")
     yield
     await close_mongo()
     await close_db()

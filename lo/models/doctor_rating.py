@@ -53,7 +53,6 @@ class RatingModel:
             },
         )
         row = result.mappings().one()
-        await db.commit()  # Persist changes to database
         return DoctorRating(**row)
 
     @staticmethod

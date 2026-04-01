@@ -113,5 +113,4 @@ class DoctorModel:
             text("UPDATE doctors SET is_available = :avail WHERE id = :id"),
             {"id": doctor_id, "avail": available},
         )
-        await db.commit()  # Persist changes to database
         return result.rowcount > 0

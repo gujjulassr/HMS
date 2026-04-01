@@ -145,7 +145,6 @@ class AppointmentModel:
             fields,
         )
         row = result.mappings().first()
-        await db.commit()  # Persist changes to database
         return _safe_appointment(row) if row else None
 
     @staticmethod

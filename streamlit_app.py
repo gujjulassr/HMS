@@ -2839,23 +2839,33 @@ def page_staff_session():
             age_g += f"/{entry['patient_gender'][:1].upper()}"
 
         # Wait time for checked-in patients
+        # Normal patients: how long PAST their scheduled slot time (now - slot_time)
+        # Emergency patients: time since check-in (now - checked_in_at)
         wait_str = ""
         if status == "checked_in":
-            ci_at = entry.get("checked_in_at")
-            if ci_at:
-                try:
-                    from datetime import timezone as _tz
-                    ci_time = datetime.fromisoformat(str(ci_at).replace("Z", "+00:00"))
-                    # Compare in UTC to avoid timezone offset issues (IST=UTC+5:30=330min)
-                    now_utc = datetime.now(_tz.utc)
-                    if ci_time.tzinfo is None:
-                        ci_time = ci_time.replace(tzinfo=_tz.utc)
-                    wait_min = int((now_utc - ci_time).total_seconds() / 60)
-                    if wait_min < 0:
+            try:
+                now_local = datetime.now()
+                now_min = now_local.hour * 60 + now_local.minute
+
+                slot_t_raw = entry.get("original_slot_time", "")
+                if slot_t_raw and not entry.get("is_emergency"):
+                    # Wait = now - scheduled slot time
+                    s_hh, s_mm = int(str(slot_t_raw)[:2]), int(str(slot_t_raw)[3:5])
+                    slot_min = s_hh * 60 + s_mm
+                    wait_min = max(now_min - slot_min, 0)
+                else:
+                    # Emergency / no slot — time since check-in (local time)
+                    ci_at = entry.get("checked_in_at")
+                    if ci_at:
+                        ci_str = str(ci_at)
+                        # Strip timezone suffix if present — we stored local time
+                        ci_time = datetime.fromisoformat(ci_str.replace("Z", "").split("+")[0])
+                        wait_min = max(int((now_local - ci_time).total_seconds() / 60), 0)
+                    else:
                         wait_min = 0
-                    wait_str = f"  •  ⏳ {wait_min}m"
-                except Exception:
-                    pass
+                wait_str = f"  •  ⏳ {wait_min}m"
+            except Exception:
+                pass
 
         # ── Step tracker (4-step visual flow) ──
         steps_data = [
@@ -2903,12 +2913,12 @@ def page_staff_session():
             appt_date_display = s_date.strftime("%B %d, %Y") if s_date else session_date_str
             appt_day = s_date.strftime("%A") if s_date else ""
             st.markdown(
-                f'<div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:10px 14px;margin-bottom:10px">'
-                f'<div style="display:flex;flex-wrap:wrap;gap:16px;font-size:0.9em">'
-                f'<span>📆 <strong>{appt_day}, {appt_date_display}</strong></span>'
-                f'<span>🕐 <strong>{slot_t}</strong> ({dur_min} min)</span>'
-                f'<span>🩺 <strong>{doctor_name}</strong></span>'
-                f'<span>🎫 {"<strong>Emergency</strong>" if int(slot) == 0 else f"Slot <strong>#{slot}</strong>"}</span>'
+                f'<div style="background:#1e3a5f;border:1px solid #2d5a8e;border-radius:8px;padding:10px 14px;margin-bottom:10px">'
+                f'<div style="display:flex;flex-wrap:wrap;gap:16px;font-size:0.9em;color:#e2e8f0">'
+                f'<span>📆 <strong style="color:#ffffff">{appt_day}, {appt_date_display}</strong></span>'
+                f'<span>🕐 <strong style="color:#ffffff">{slot_t}</strong> ({dur_min} min)</span>'
+                f'<span>🩺 <strong style="color:#ffffff">{doctor_name}</strong></span>'
+                f'<span>🎫 {"<strong style=color:#ffffff>Emergency</strong>" if int(slot) == 0 else f"Slot <strong style=color:#ffffff>#{slot}</strong>"}</span>'
                 f'</div></div>',
                 unsafe_allow_html=True,
             )

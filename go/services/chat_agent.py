@@ -132,6 +132,7 @@ async def get_doctor_sessions(ctx: RunContextWrapper, doctor_id: str) -> str:
     Args:
         doctor_id: UUID of the doctor (doctor_id or user_id both work).
     """
+    from datetime import datetime as _dt
     token = ctx.context["token"]
     params = {"date_from": date.today().isoformat(), "include_all": "true"}
     logger.info(f"get_doctor_sessions called: doctor_id='{doctor_id}'")
@@ -139,13 +140,52 @@ async def get_doctor_sessions(ctx: RunContextWrapper, doctor_id: str) -> str:
     logger.info(f"get_doctor_sessions result: type={type(result).__name__}, preview={str(result)[:300]}")
     if isinstance(result, list):
         sessions = []
+        now = _dt.now()
+        now_min = now.hour * 60 + now.minute
+        today_str = date.today().isoformat()
         for s in result:
             sid = s.get("session_id") or s.get("id")
+            sess_date = s.get("session_date", "")
+            start_str = s.get("start_time", "")
+            end_str = s.get("end_time", "")
+            total = s.get("total_slots", 0)
+            booked = s.get("booked_count", 0)
+            max_per = s.get("max_patients_per_slot", 2)
+            available = max(total * max_per - booked, 0)
+
+            # Check if session time has already passed (only for today)
+            time_passed = False
+            if str(sess_date) == today_str and end_str:
+                try:
+                    eh, em = int(str(end_str)[:2]), int(str(end_str)[3:5])
+                    if now_min > eh * 60 + em:
+                        time_passed = True
+                except Exception:
+                    pass
+
+            # Calculate next available slot time (for today's active sessions)
+            next_available_time = start_str  # default to session start
+            if str(sess_date) == today_str and not time_passed:
+                try:
+                    sh, sm = int(str(start_str)[:2]), int(str(start_str)[3:5])
+                    s_total = sh * 60 + sm
+                    dur = s.get("slot_duration_minutes", 15)
+                    next_min = s_total
+                    while next_min <= now_min:
+                        next_min += dur
+                    nh, nm = divmod(next_min, 60)
+                    next_available_time = f"{nh:02d}:{nm:02d}"
+                except Exception:
+                    pass
+
             info = {
                 "session_id": sid,
-                "date": s.get("session_date"), "start": s.get("start_time"), "end": s.get("end_time"),
+                "date": sess_date, "start": start_str, "end": end_str,
                 "status": s.get("status"),
-                "total_slots": s.get("total_slots"),
+                "total_slots": total,
+                "available_slots": available,
+                "time_passed": time_passed,
+                "next_available_time": next_available_time,
             }
             # For active/today sessions, include full patient list
             if s.get("status") == "active" and sid:
@@ -208,6 +248,7 @@ async def book_appointment(ctx: RunContextWrapper, session_id: str, preferred_ti
                 start_str = session_data.get("start_time", "")
                 duration = session_data.get("slot_duration_minutes", 15)
                 total_slots = session_data.get("total_slots", 0)
+                sess_date = str(session_data.get("session_date", ""))
 
                 # Parse start_time (could be "HH:MM" or "HH:MM:SS")
                 start_parts = str(start_str).split(":")
@@ -218,6 +259,20 @@ async def book_appointment(ctx: RunContextWrapper, session_id: str, preferred_ti
                 pref_parts = preferred_time.strip().split(":")
                 pref_h, pref_m = int(pref_parts[0]), int(pref_parts[1]) if len(pref_parts) > 1 else 0
                 pref_total = pref_h * 60 + pref_m
+
+                # Reject if requested time is in the past (for today's sessions)
+                from datetime import datetime as _dt
+                now = _dt.now()
+                if sess_date == now.strftime("%Y-%m-%d"):
+                    now_total = now.hour * 60 + now.minute
+                    if pref_total <= now_total:
+                        now_hh, now_mm = divmod(now_total, 60)
+                        # Calculate next available slot time
+                        next_slot_min = start_total
+                        while next_slot_min <= now_total:
+                            next_slot_min += duration
+                        next_hh, next_mm = divmod(next_slot_min, 60)
+                        return _j({"error": f"Cannot book at {preferred_time} — that time has already passed. Current time is {now_hh:02d}:{now_mm:02d}. The next available slot is at {next_hh:02d}:{next_mm:02d}."})
 
                 # Calculate slot number: (time_diff / duration) + 1
                 diff = pref_total - start_total
@@ -263,16 +318,43 @@ async def undo_cancel_appointment(ctx: RunContextWrapper, appointment_id: str) -
 
 @function_tool
 async def get_my_appointments(ctx: RunContextWrapper) -> str:
-    """Get the current patient's appointments (all statuses)."""
+    """Get the current patient's appointments (all statuses).
+    Returns appointments where you are the patient OR the booker.
+    Check 'booked_for' field: 'self' means your own appointment,
+    otherwise it shows the beneficiary's name (family member).
+    Includes session details: slot_time, delay, queue info."""
+    my_pid = ctx.context.get("patient_id", "")
     result = await _api("GET", "/appointments/my", ctx.context["token"])
     if isinstance(result, list):
         result = {"appointments": result, "total": len(result)}
     if isinstance(result, dict) and "appointments" in result:
-        return _j({"appointments": [{
-            "id": a.get("appointment_id"), "doctor": a.get("doctor_name"),
-            "specialization": a.get("specialization"), "date": a.get("session_date"),
-            "time": a.get("start_time"), "slot": a.get("slot_number"), "status": a.get("status"),
-        } for a in result["appointments"]], "total": result.get("total")})
+        appointments = []
+        for a in result["appointments"]:
+            # Determine if this is for self or a family member
+            appt_patient_id = a.get("patient_id", "")
+            patient_name = a.get("patient_name", "")
+            if appt_patient_id == my_pid:
+                booked_for = "self"
+            else:
+                booked_for = patient_name or "family member"
+            appointments.append({
+                "id": a.get("appointment_id"),
+                "doctor": a.get("doctor_name"),
+                "specialization": a.get("specialization"),
+                "date": a.get("session_date"),
+                "session_start": a.get("start_time"),
+                "session_end": a.get("end_time"),
+                "slot": a.get("slot_number"),
+                "slot_time": a.get("slot_time"),
+                "delay_minutes": a.get("delay_minutes", 0),
+                "status": a.get("status"),
+                "priority_tier": a.get("priority_tier"),
+                "is_emergency": a.get("is_emergency"),
+                "checked_in_at": str(a.get("checked_in_at", "")) if a.get("checked_in_at") else None,
+                "patient_name": patient_name,
+                "booked_for": booked_for,
+            })
+        return _j({"appointments": appointments, "total": result.get("total")})
     return _j(result)
 
 
@@ -820,6 +902,38 @@ async def staff_register_and_book(
 
 
 @function_tool
+async def emergency_register_and_book(
+    ctx: RunContextWrapper, session_id: str,
+    full_name: str, reason: str = "Emergency walk-in",
+    phone: str = "", gender: str = "other",
+    date_of_birth: str = "",
+) -> str:
+    """Register a NEW walk-in patient and book them as an EMERGENCY in one step.
+    Use this when the patient does NOT exist in the system and needs emergency booking.
+    The patient gets slot_number=0, is_emergency=True, CRITICAL priority, and is auto-checked-in.
+    Args:
+        session_id: UUID of the session.
+        full_name: Patient's full name (required, min 2 chars).
+        reason: Emergency reason (min 5 chars).
+        phone: Phone number (optional).
+        gender: male, female, or other.
+        date_of_birth: YYYY-MM-DD format (optional).
+    """
+    payload = {
+        "session_id": session_id,
+        "full_name": full_name,
+        "reason": reason,
+    }
+    if phone:
+        payload["phone"] = phone
+    if gender:
+        payload["gender"] = gender
+    if date_of_birth:
+        payload["date_of_birth"] = date_of_birth
+    return _j(await _api("POST", "/appointments/emergency-register-book", ctx.context["token"], payload=payload))
+
+
+@function_tool
 async def staff_cancel_appointment(ctx: RunContextWrapper, appointment_id: str, reason: str = "Cancelled by staff") -> str:
     """Cancel an appointment as staff (doctor/nurse/admin). Sends cancellation email and calendar event.
     Args:
@@ -859,15 +973,61 @@ async def get_my_doctor_sessions(ctx: RunContextWrapper, date_from: str = "", da
 
 
 @function_tool
-async def reassign_appointment(ctx: RunContextWrapper, appointment_id: str, target_session_id: str, target_slot_number: int) -> str:
+async def reassign_appointment(ctx: RunContextWrapper, appointment_id: str, target_session_id: str, preferred_time: str = "", target_slot_number: int = 0) -> str:
     """Reassign an appointment to a different time slot or doctor's session.
     Use this to change an appointment's time (same doctor, different slot) OR move to another doctor.
     Args:
         appointment_id: UUID of the appointment to reassign.
         target_session_id: UUID of the destination session (can be the SAME session for time change, or a different doctor's session).
-        target_slot_number: Slot number in the target session (1-based). Calculate from session start_time and slot_duration.
-            Example: session starts at 09:00 with 15-min slots → slot 1=09:00, slot 2=09:15, ..., slot 9=11:00.
+        preferred_time: Desired time in HH:MM 24-hour format (e.g. "16:00" for 4 PM). ALWAYS use this when the user mentions a time. The system auto-computes the correct slot.
+        target_slot_number: Slot number (1-based). Only use this if user explicitly says a slot number. Otherwise use preferred_time.
     """
+    # If preferred_time given, auto-compute slot from session details
+    if preferred_time and target_slot_number <= 0:
+        try:
+            session_data = await _api("GET", f"/sessions/{target_session_id}", ctx.context["token"])
+            if isinstance(session_data, dict) and "error" not in session_data:
+                start_str = session_data.get("start_time", "")
+                duration = session_data.get("slot_duration_minutes", 15)
+                total_slots = session_data.get("total_slots", 0)
+                sess_date = str(session_data.get("session_date", ""))
+
+                start_parts = str(start_str).split(":")
+                start_h, start_m = int(start_parts[0]), int(start_parts[1])
+                start_total = start_h * 60 + start_m
+
+                pref_parts = preferred_time.strip().split(":")
+                pref_h, pref_m = int(pref_parts[0]), int(pref_parts[1]) if len(pref_parts) > 1 else 0
+                pref_total = pref_h * 60 + pref_m
+
+                # Reject if requested time is in the past (for today's sessions)
+                from datetime import datetime as _dt
+                now = _dt.now()
+                if sess_date == now.strftime("%Y-%m-%d"):
+                    now_total = now.hour * 60 + now.minute
+                    if pref_total <= now_total:
+                        next_slot_min = start_total
+                        while next_slot_min <= now_total:
+                            next_slot_min += duration
+                        next_hh, next_mm = divmod(next_slot_min, 60)
+                        return _j({"error": f"Cannot reschedule to {preferred_time} — that time has already passed. Current time is {now.hour:02d}:{now.minute:02d}. The next available slot is at {next_hh:02d}:{next_mm:02d}."})
+
+                diff = pref_total - start_total
+                if diff >= 0:
+                    target_slot_number = (diff // duration) + 1
+                    if target_slot_number > total_slots:
+                        return _j({"error": f"Time {preferred_time} is outside session hours. Max slot is {total_slots}."})
+                else:
+                    return _j({"error": f"Time {preferred_time} is before session start ({start_str})."})
+            else:
+                return _j({"error": f"Could not fetch session details: {session_data}"})
+        except Exception as e:
+            logger.error(f"reassign_appointment time conversion failed: {e}", exc_info=True)
+            return _j({"error": f"Could not convert time '{preferred_time}' to slot: {e}"})
+
+    if target_slot_number <= 0:
+        return _j({"error": "Provide either preferred_time (e.g. '16:00') or target_slot_number (1-based)."})
+
     return _j(await _api("POST", "/appointments/reassign", ctx.context["token"],
                          payload={"appointment_id": appointment_id,
                                   "target_session_id": target_session_id,
@@ -1070,6 +1230,7 @@ _INFO_TOOLS = [list_departments, list_doctors, get_doctor_details, get_doctor_se
 _STAFF_INFO_TOOLS = _INFO_TOOLS + [get_operations_board]
 
 _PATIENT_TOOLS = [book_appointment, cancel_appointment, undo_cancel_appointment,
+                  reassign_appointment,
                   get_my_appointments, get_my_profile, get_my_relationships,
                   update_family_member]
 
@@ -1085,11 +1246,12 @@ _SESSION_TOOLS = [create_session, activate_session, deactivate_session, doctor_c
 
 _STAFF_BOOK_TOOLS = [search_patients, get_patient_full_details, update_patient_details,
                      staff_book, staff_register_and_book,
-                     emergency_book, staff_cancel_appointment, reassign_appointment]
+                     emergency_book, emergency_register_and_book,
+                     staff_cancel_appointment, reassign_appointment]
 
 _DOCTOR_EXTRA_TOOLS = [get_my_doctor_sessions, search_patients, get_patient_full_details,
                        update_patient_details, staff_book,
-                       staff_register_and_book, emergency_book,
+                       staff_register_and_book, emergency_book, emergency_register_and_book,
                        staff_cancel_appointment, reassign_appointment]
 
 _ADMIN_TOOLS = [admin_get_stats, admin_list_users, admin_create_user, admin_toggle_user,
@@ -1138,12 +1300,56 @@ BOOKING FLOW:
 3. Patient picks a session and slot → book_appointment
 Always confirm doctor + date + slot before booking.
 
+RESCHEDULING (changing appointment time):
+When a patient says "reschedule", "change time", "move to X o'clock", etc.:
+1. get_my_appointments() → find the appointment to reschedule (get appointment_id + session_id)
+2. Call reassign_appointment(appointment_id=..., target_session_id=..., preferred_time="HH:MM")
+   - ALWAYS pass the time as preferred_time in 24-hour format (e.g. "16:00" for 4 PM, "09:30" for 9:30 AM)
+   - NEVER manually compute slot numbers — the system auto-computes the correct slot from preferred_time
+   - If same doctor same day, target_session_id = the current session_id
+   - If different doctor or day, get the new session_id from get_doctor_sessions first
+3. Confirm the new time to the patient after success.
+CRITICAL: When converting patient times to 24h format:
+  - "4 o'clock" in afternoon context = "16:00" NOT "04:00"
+  - "3:30" in afternoon context = "15:30"
+  - Always consider the session hours to determine AM vs PM
+
+CRITICAL — TIME AWARENESS:
+- Sessions have a "time_passed" field. If time_passed=true, the session's end time has ALREADY passed.
+- NEVER offer to book a session where time_passed=true. Say "This session has already ended" and suggest
+  the next available session (afternoon session or tomorrow).
+- Sessions also have "available_slots". If available_slots=0, say "This session is fully booked."
+- Only suggest sessions that are bookable: time_passed=false AND available_slots > 0.
+- Sessions have "next_available_time" — this is the EARLIEST slot that hasn't passed yet.
+  ALWAYS use next_available_time when suggesting a booking time. NEVER suggest a time before next_available_time.
+  Example: if next_available_time="15:30", suggest "The earliest available slot is 3:30 PM", NOT "2:00 PM".
+- When booking, ALWAYS pass preferred_time to book_appointment. The system will reject past times automatically.
+
 OTHER CAPABILITIES:
 - View appointments: get_my_appointments
+  This returns ALL appointments where you are the patient OR the booker.
+  Each appointment has a "booked_for" field:
+    - "self" = YOUR OWN appointment
+    - Any other name = appointment you booked for a FAMILY MEMBER (sibling, parent, child, etc.)
+  CRITICAL: When "booked_for" is NOT "self", you MUST say "your [relationship]'s appointment" or
+  "[patient_name]'s appointment", NOT "your appointment". Example:
+    - booked_for: "Nagarjuna" → "Nagarjuna's appointment" or "your sibling's appointment"
+    - booked_for: "self" → "your appointment"
+  If the patient asks "do I have an appointment?" and ALL results have booked_for != "self",
+  say "You don't have any appointments for yourself, but you booked appointments for [names]."
 - Cancel/undo-cancel: cancel_appointment, undo_cancel_appointment
+- RESCHEDULE (change time): use reassign_appointment with preferred_time
 - Profile & family: get_my_profile, get_my_relationships, update_family_member
   Family data includes: name, phone, gender, age, blood_group, dob, abha_id, address, email, emergency contacts.
   Show ALL details when asked — don't say "not available" if the data exists in the response.
+
+FAMILY / SIBLING / RELATIVE APPOINTMENT LOOKUP:
+When a patient asks about a family member's appointment (e.g. "my sibling has an appointment", "check my mother's booking"):
+1. First call get_my_relationships() to find the relative and their name
+2. Then call get_my_appointments() — this includes appointments you BOOKED FOR others
+3. Filter the results to find appointments where the relative is the patient (beneficiary)
+4. If no match is found, explain: "I can only see appointments that were booked through your account. If your [relative] booked their own appointment separately, they would need to check from their own account."
+NEVER say "I can't access their records" without first trying steps 1-3.
 
 RATING & FEEDBACK:
 - After a completed appointment, patients can rate their doctor: submit_rating(appointment_id, rating, review)
@@ -1187,15 +1393,18 @@ CAPABILITIES (use ONLY when the doctor asks):
 - Edit patient profile: update_patient_details(patient_id, ...) → updates name, email, phone, gender, blood_group, address, etc.
   IMPORTANT: The response contains current_data with the ACTUAL DB values. Always report those values, NOT your memory.
   If the response contains "error", the update FAILED — tell the user it failed, do NOT say it succeeded.
-- Book patients: search_patients → staff_book or staff_register_and_book (walk-ins)
+- Book patients: search_patients → staff_book or staff_register_and_book (walk-ins) or emergency_register_and_book (emergency walk-ins)
 - Cancel appointments: staff_cancel_appointment
+- Reassign/Reschedule: reassign_appointment — ALWAYS pass preferred_time in HH:MM 24-hour format (e.g. "16:00" for 4 PM). NEVER manually compute slot numbers.
 - **Change priority**: Use set_patient_priority(patient_name, doctor_name, priority_tier) — it finds the appointment automatically.
   Example: set_patient_priority("nagarjuna", "Vikram", "CRITICAL") — no need to look up IDs.
   Only use escalate_priority if you already have the appointment_id.
 - **EMERGENCY FLAG vs NEW EMERGENCY ENTRY**:
   If patient ALREADY has an appointment in the queue → use set_patient_priority(name, doctor, "CRITICAL", is_emergency=True) to mark existing appointment as emergency.
-  If patient has NO appointment yet → use emergency_book to create a new emergency entry.
+  If patient has NO appointment yet AND EXISTS in the system → use emergency_book(session_id, patient_id, reason) to create a new emergency entry.
+  If patient has NO appointment AND DOES NOT EXIST in the system → use emergency_register_and_book(session_id, full_name, reason) to register + emergency book in one step.
   NEVER use emergency_book if the patient already has an appointment — it creates duplicates!
+  NEVER use staff_register_and_book for emergency patients — it creates a regular appointment, NOT an emergency one.
 - View other doctors/departments: list_doctors, get_operations_board
 
 RATING & FEEDBACK:
@@ -1237,7 +1446,7 @@ CAPABILITIES (use when asked):
 - Edit patient profile: update_patient_details(patient_id, ...) → updates name, email, phone, gender, blood_group, address, etc.
   IMPORTANT: The response contains current_data with the ACTUAL DB values. Always report those values, NOT your memory.
   If the response contains "error", the update FAILED — tell the user it failed, do NOT say it succeeded.
-- Book for patients: staff_book (existing) or staff_register_and_book (walk-in)
+- Book for patients: staff_book (existing) or staff_register_and_book (walk-in, non-emergency) or emergency_register_and_book (walk-in emergency)
 - Cancel appointments: staff_cancel_appointment
 - **EMERGENCY FLAG vs NEW EMERGENCY ENTRY**:
   If patient ALREADY has an appointment → use set_patient_priority(name, doctor, "CRITICAL", is_emergency=True) to mark existing appointment as emergency.
@@ -1255,13 +1464,13 @@ CAPABILITIES (use when asked):
 - Session controls: create_session, activate_session, deactivate_session, update_delay, extend_session, complete_session, cancel_session
   To CREATE a session: list_doctors(include_unavailable=True) → get doctor_id → create_session(date, start, end, doctor_id=id)
   Standard times: Morning 09:00-13:00, Afternoon 14:00-17:00.
-- Reassign: reassign_appointment (same doctor different slot, or different doctor)
-  Slot calculation: slot = 1 + (target_minutes - session_start_minutes) / slot_duration_minutes
+- Reassign/Reschedule: reassign_appointment — ALWAYS pass preferred_time in HH:MM 24-hour format (e.g. "16:00" for 4 PM).
+  NEVER manually compute slot numbers — the tool auto-computes the correct slot from preferred_time.
 - Operations board: get_operations_board, list_doctors, get_doctor_sessions
   Show ALL departments when asked about operations.
 
 BOOKING FLOW: search_patients → if found use staff_book, if not found use staff_register_and_book → pick doctor/session/slot → book.
-REASSIGNMENT: Keep same doctor/session unless nurse says otherwise. Calculate slot from time.
+REASSIGNMENT: Keep same doctor/session unless nurse says otherwise. ALWAYS use preferred_time parameter, NOT slot_number.
 
 RATING & FEEDBACK:
 - View doctor ratings: get_doctor_ratings(doctor_id), get_doctor_rating_stats(doctor_id)
@@ -1306,7 +1515,8 @@ CAPABILITIES (use when asked):
   To make a doctor "available tomorrow" = create a session for them tomorrow.
 - Audit logs: admin_get_audit
 - Config: admin_get_config, admin_update_config
-- Booking: staff_book, staff_register_and_book, staff_cancel_appointment, reassign_appointment
+- Booking: staff_book, staff_register_and_book, emergency_register_and_book, staff_cancel_appointment, reassign_appointment
+  REASSIGNMENT: ALWAYS use preferred_time in HH:MM 24-hour format (e.g. "16:00" for 4 PM). NEVER manually compute slot numbers.
 - Queue: get_queue, get_emergency_patients, checkin_patient, call_patient, complete_appointment, escalate_priority, mark_no_show, undo actions
   IMPORTANT: The queue contains BOTH normal and emergency patients.
   Emergency patients have is_emergency=true and slot_number=0. They are auto-checked-in.

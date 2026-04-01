@@ -143,5 +143,4 @@ class PatientModel:
             fields,
         )
         row = result.mappings().first()
-        await db.commit()  # Persist changes to database
         return _row_to_patient(row) if row else None

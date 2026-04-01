@@ -546,7 +546,8 @@ async def emergency_book_route(
     )
 
     # Auto check-in emergency patients so they appear in the queue immediately
-    await AppointmentModel.update_status(db, appointment.id, "checked_in")
+    from datetime import datetime as _dt
+    await AppointmentModel.update_status(db, appointment.id, "checked_in", checked_in_at=_dt.now())
     await db.commit()
 
     # Audit
@@ -635,12 +636,13 @@ async def undo_cancel_route(
 @router.post("/reassign")
 async def reassign_appointment(
     request: Request,
-    user: User = Depends(require_role("nurse", "admin")),
+    user: User = Depends(require_role("nurse", "admin", "patient")),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Reassign a booked/checked_in appointment to a different session or time slot.
     Supports same-doctor time changes and cross-doctor reassignments.
+    Patients can only reassign their own (or family-booked) appointments.
     """
     from sqlalchemy import text as sql_text
 
@@ -666,6 +668,16 @@ async def reassign_appointment(
             raise HTTPException(status_code=404, detail="Appointment not found")
         if appt.status not in ("booked", "checked_in"):
             raise HTTPException(status_code=400, detail=f"Cannot reassign: status is '{appt.status}'")
+
+        # Patients can only reassign appointments they booked
+        if user.role == "patient":
+            patient_row = await db.execute(
+                sql_text("SELECT id FROM patients WHERE user_id = :uid LIMIT 1"),
+                {"uid": user.id},
+            )
+            patient_rec = patient_row.mappings().first()
+            if not patient_rec or appt.booked_by_patient_id != patient_rec["id"]:
+                raise HTTPException(status_code=403, detail="You can only reschedule appointments you booked.")
 
         # Validate target session is active and slot is in range
         target_session = await SessionModel.get_by_id(db, target_session_id)
@@ -986,4 +998,149 @@ async def staff_register_book(
         "message": f"{full_name} registered and booked — Slot {slot_number}, Position {slot_pos}.",
         "patient_id": str(new_patient.id),
         "appointment_id": str(appointment.id),
+    }
+
+
+# ─── POST /emergency-register-book — register NEW patient + emergency book ────
+@router.post("/emergency-register-book")
+async def emergency_register_book(
+    body: dict,
+    user: User = Depends(require_role("nurse", "admin", "doctor")),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Staff-only: Register a new walk-in patient AND book them as an emergency in one step.
+    Creates user → patient → emergency appointment (slot_number=0, is_emergency=True, auto check-in).
+    """
+    from datetime import date as _date_type, datetime as _dt
+    import uuid as _uuid
+
+    # Required fields
+    full_name = body.get("full_name", "").strip()
+    if not full_name or len(full_name) < 2:
+        raise HTTPException(400, "Full name is required (min 2 chars)")
+
+    session_id = UUID(body["session_id"])
+    reason = body.get("reason", "Emergency walk-in").strip()
+    if len(reason) < 5:
+        reason = "Emergency walk-in"
+
+    # Optional fields
+    def _s(val):
+        return val.strip() if isinstance(val, str) else None
+
+    phone = _s(body.get("phone")) or None
+    gender = body.get("gender") or "other"
+    dob_str = body.get("date_of_birth") or ""
+    abha_id = _s(body.get("abha_id")) or None
+    blood_group = _s(body.get("blood_group")) or None
+    address = _s(body.get("address")) or None
+    emergency_contact = _s(body.get("emergency_contact")) or None
+    emergency_phone = _s(body.get("emergency_phone")) or None
+
+    priority_tier = (body.get("priority_tier") or "CRITICAL").upper()
+    if priority_tier not in ("NORMAL", "HIGH", "CRITICAL"):
+        priority_tier = "CRITICAL"
+
+    try:
+        dob = _date_type.fromisoformat(dob_str) if dob_str else _date_type(2000, 1, 1)
+    except Exception:
+        dob = _date_type(2000, 1, 1)
+
+    # Unique placeholder email
+    placeholder_email = f"walkin_{_uuid.uuid4().hex[:8]}@dpms.local"
+
+    # Validate session
+    session = await SessionModel.get_by_id_for_update(db, session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.status != "active":
+        raise HTTPException(400, f"Session is {session.status}")
+
+    # 1. Create user
+    new_user = await UserModel.create(
+        db,
+        email=placeholder_email,
+        full_name=full_name,
+        role="patient",
+        password_hash="WALKIN_NO_LOGIN",
+        phone=phone,
+    )
+
+    # 2. Create patient record
+    new_patient = await PatientModel.create(
+        db,
+        user_id=new_user.id,
+        date_of_birth=dob,
+        gender=gender,
+        abha_id=abha_id,
+        blood_group=blood_group,
+        emergency_contact_name=emergency_contact,
+        emergency_contact_phone=emergency_phone,
+        address=address,
+    )
+
+    # 3. Create self-relationship
+    from go.models.patient_relationship import RelationshipModel
+    try:
+        await RelationshipModel.create(
+            db,
+            booker_patient_id=new_patient.id,
+            beneficiary_patient_id=new_patient.id,
+            relationship_type="self",
+        )
+    except Exception:
+        pass
+
+    # 4. Emergency booking — slot_number=0, unique slot_position
+    from sqlalchemy import text as _txt
+    _pos_result = await db.execute(
+        _txt("SELECT COALESCE(MAX(slot_position), 0) + 1 AS next_pos "
+             "FROM appointments WHERE session_id = :sid AND slot_number = 0"),
+        {"sid": session_id},
+    )
+    _next_pos = _pos_result.scalar() or 1
+
+    appointment = await AppointmentModel.create(
+        db,
+        session_id=session_id,
+        patient_id=new_patient.id,
+        booked_by_patient_id=new_patient.id,
+        slot_number=0,
+        slot_position=_next_pos,
+        priority_tier=priority_tier,
+        is_emergency=True,
+        visual_priority=10,
+    )
+
+    # Auto check-in emergency patients
+    await AppointmentModel.update_status(db, appointment.id, "checked_in", checked_in_at=_dt.now())
+    await db.commit()
+
+    # Audit
+    try:
+        await AuditModel.create(
+            db,
+            action="emergency_register_book",
+            performed_by_user_id=user.id,
+            appointment_id=appointment.id,
+            patient_id=new_patient.id,
+            metadata={
+                "patient_name": full_name,
+                "reason": reason,
+                "priority_tier": priority_tier,
+                "registered_by": str(user.id),
+            },
+        )
+        await db.commit()
+    except Exception:
+        try: await db.rollback()
+        except Exception: pass
+
+    return {
+        "status": "emergency_registered_and_booked",
+        "message": f"{full_name} registered as emergency patient — Priority: {priority_tier}. Reason: {reason}",
+        "patient_id": str(new_patient.id),
+        "appointment_id": str(appointment.id),
+        "is_emergency": True,
     }

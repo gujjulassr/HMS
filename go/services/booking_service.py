@@ -157,6 +157,22 @@ async def book_appointment(
 
     # ── Step 6: No position → waitlist ──
     if slot_position is None:
+        # Check if patient is already on the waitlist for this session
+        from sqlalchemy import text as _text
+        _existing = await db.execute(
+            _text("SELECT id, status FROM waitlist WHERE session_id = :sid AND patient_id = :pid LIMIT 1"),
+            {"sid": session_id, "pid": beneficiary_patient_id},
+        )
+        _existing_row = _existing.mappings().first()
+        if _existing_row:
+            if _existing_row["status"] == "waiting":
+                raise ValueError("This patient is already on the waitlist for this session.")
+            # Old promoted/cancelled/expired entry — remove so we can re-add
+            await db.execute(
+                _text("DELETE FROM waitlist WHERE id = :wid"),
+                {"wid": _existing_row["id"]},
+            )
+
         waitlist_entry = await WaitlistModel.create(
             db,
             session_id=session_id,

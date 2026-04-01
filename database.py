@@ -32,7 +32,10 @@ async_session = sessionmaker(
 async def get_db() -> AsyncSession:
     """
     FastAPI dependency: yields a database session.
-    Auto-closes when the request finishes.
+    Auto-commits on success, rolls back on error, always closes.
+
+    This ensures all operations within a single API request are part of
+    one atomic transaction — either everything persists or nothing does.
 
     Usage in routes:
         @router.get("/example")
@@ -42,6 +45,10 @@ async def get_db() -> AsyncSession:
     async with async_session() as session:
         try:
             yield session
+            await session.commit()    # Persist all changes on success
+        except Exception:
+            await session.rollback()  # Undo everything on error
+            raise
         finally:
             await session.close()
 
@@ -88,7 +95,8 @@ async def init_db():
                         'booking_confirmation', 'cancellation', 'reminder',
                         'waitlist_promotion', 'queue_update', 'relationship_request',
                         'BOOKED_BY_STAFF', 'EMERGENCY_BOOKED', 'DELAY_UPDATE',
-                        'CANNOT_BE_SEEN', 'YOUR_TURN', 'SESSION_CANCELLED'
+                        'CANNOT_BE_SEEN', 'YOUR_TURN', 'SESSION_CANCELLED',
+                        'no_show'
                     )
                 );
             EXCEPTION WHEN duplicate_object THEN NULL;

@@ -87,7 +87,6 @@ class WaitlistModel:
             {"id": waitlist_id},
         )
         row = result.mappings().first()
-        await db.commit()  # Persist changes to database
         return WaitlistEntry(**row) if row else None
 
     @staticmethod
@@ -96,7 +95,6 @@ class WaitlistModel:
             text("UPDATE waitlist SET status = 'cancelled' WHERE id = :id AND status = 'waiting'"),
             {"id": waitlist_id},
         )
-        await db.commit()  # Persist changes to database
         return result.rowcount > 0
 
     @staticmethod
