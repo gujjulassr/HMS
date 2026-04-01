@@ -328,6 +328,14 @@ def complete_session(payload: dict) -> dict:
     return r.json()
 
 
+def create_session(payload: dict) -> dict:
+    """POST /sessions/create — create a new session for a doctor."""
+    r = _request("POST", f"{BASE_URL}/sessions/create", json=payload)
+    if r.status_code >= 400:
+        _raise_api_error(r)
+    return r.json()
+
+
 def activate_session(payload: dict) -> dict:
     """POST /sessions/activate — set inactive → active."""
     r = _request("POST", f"{BASE_URL}/sessions/activate", json=payload)
@@ -611,6 +619,8 @@ def admin_get_audit(action: str = "", from_date: str = "", to_date: str = "",
 def admin_list_patients(search: str = "", high_risk_only: bool = False,
                         specialization: str = "", doctor_id: str = "",
                         include_inactive: bool = False,
+                        sort_by: str = "newest",
+                        from_date: str = "", to_date: str = "",
                         limit: int = 50, offset: int = 0) -> list:
     """GET /admin/patients — list patients."""
     params = {"limit": limit, "offset": offset}
@@ -624,6 +634,12 @@ def admin_list_patients(search: str = "", high_risk_only: bool = False,
         params["specialization"] = specialization
     if doctor_id:
         params["doctor_id"] = doctor_id
+    if sort_by:
+        params["sort_by"] = sort_by
+    if from_date:
+        params["from_date"] = from_date
+    if to_date:
+        params["to_date"] = to_date
     r = _request("GET", f"{BASE_URL}/admin/patients", params=params)
     if r.status_code >= 400:
         _raise_api_error(r)
@@ -662,6 +678,18 @@ def admin_update_patient(patient_id: str, payload: dict) -> dict:
     return r.json()
 
 
+def admin_add_beneficiary(patient_id: str, payload: dict) -> dict:
+    """POST /admin/patients/{id}/add-beneficiary — add family member."""
+    r = _request(
+        "POST",
+        f"{BASE_URL}/admin/patients/{patient_id}/add-beneficiary",
+        json=payload,
+    )
+    if r.status_code >= 400:
+        _raise_api_error(r)
+    return r.json()
+
+
 def admin_list_sessions(date_str: str = "", status: str = "",
                         specialization: str = "", doctor_id: str = "") -> list:
     """GET /admin/sessions — all sessions."""
@@ -675,6 +703,14 @@ def admin_list_sessions(date_str: str = "", status: str = "",
     if doctor_id:
         params["doctor_id"] = doctor_id
     r = _request("GET", f"{BASE_URL}/admin/sessions", params=params)
+    if r.status_code >= 400:
+        _raise_api_error(r)
+    return r.json()
+
+
+def admin_update_session(session_id: str, payload: dict) -> dict:
+    """PUT /admin/sessions/{session_id}/update — edit session fields."""
+    r = _request("PUT", f"{BASE_URL}/admin/sessions/{session_id}/update", json=payload)
     if r.status_code >= 400:
         _raise_api_error(r)
     return r.json()

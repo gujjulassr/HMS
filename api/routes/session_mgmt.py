@@ -798,6 +798,15 @@ async def create_session(
     if start_time >= end_time:
         raise HTTPException(status_code=400, detail="start_time must be before end_time")
 
+    # Block past dates / past times for today
+    from datetime import datetime as _dt_cls
+    if session_date < _date_cls.today():
+        raise HTTPException(status_code=400, detail="Cannot create a session for a past date.")
+    if session_date == _date_cls.today():
+        now_time = _dt_cls.now().time()
+        if end_time <= now_time:
+            raise HTTPException(status_code=400, detail="Cannot create a session that has already ended today.")
+
     # Check for overlapping sessions — if one exists and is inactive, return it
     overlap = await db.execute(
         sql_text("""

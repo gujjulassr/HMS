@@ -80,7 +80,7 @@ class ResetRiskRequest(BaseModel):
 
 @router.get("/stats")
 async def get_dashboard_stats(
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "nurse")),
     db: AsyncSession = Depends(get_db),
 ):
     """Today's numbers at a glance."""
@@ -310,7 +310,7 @@ async def toggle_user(
 
 @router.get("/departments")
 async def list_departments(
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "nurse")),
     db: AsyncSession = Depends(get_db),
 ):
     """List all unique departments (specializations)."""
@@ -323,7 +323,7 @@ async def list_departments(
 @router.get("/doctors")
 async def list_all_doctors(
     specialization: Optional[str] = Query(None, description="Filter by department"),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "nurse")),
     db: AsyncSession = Depends(get_db),
 ):
     """List all doctors with their user info."""
@@ -354,7 +354,7 @@ async def list_all_doctors(
 async def update_doctor(
     doctor_id: str,
     body: UpdateDoctorRequest,
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "nurse")),
     db: AsyncSession = Depends(get_db),
 ):
     """Update doctor settings."""
@@ -504,12 +504,15 @@ async def list_patients(
     include_inactive: bool = Query(False, description="Include deactivated patients"),
     specialization: Optional[str] = Query(None, description="Filter by department"),
     doctor_id: Optional[str] = Query(None, description="Filter by doctor"),
+    sort_by: Optional[str] = Query(None, description="Sort: newest, oldest, risk, name"),
+    from_date: Optional[str] = Query(None, description="Registered from date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="Registered to date (YYYY-MM-DD)"),
     limit: int = Query(50, le=200),
     offset: int = Query(0),
     user: User = Depends(require_role("admin", "nurse")),
     db: AsyncSession = Depends(get_db),
 ):
-    """List patients with full details, filterable by department/doctor. Accessible by admin and nurse."""
+    """List patients with full details, filterable by department/doctor/date. Accessible by admin and nurse."""
     conditions = [] if include_inactive else ["u.is_active = true"]
     params = {"limit": limit, "offset": offset}
     joins = ""
@@ -519,6 +522,12 @@ async def list_patients(
         params["search"] = f"%{search}%"
     if high_risk_only:
         conditions.append("p.risk_score >= 7.0")
+    if from_date:
+        conditions.append("u.created_at::date >= :from_date")
+        params["from_date"] = from_date
+    if to_date:
+        conditions.append("u.created_at::date <= :to_date")
+        params["to_date"] = to_date
     if specialization or doctor_id:
         joins = """
             JOIN appointments a2 ON a2.patient_id = p.id
@@ -532,37 +541,62 @@ async def list_patients(
             conditions.append("d2.id = :doc_id")
             params["doc_id"] = UUID(doctor_id)
 
-    where = "WHERE " + " AND ".join(conditions)
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
     distinct = "DISTINCT" if (specialization or doctor_id) else ""
+    _sort_map = {
+        "newest": "u.created_at DESC",
+        "oldest": "u.created_at ASC",
+        "risk": "p.risk_score DESC, u.full_name",
+        "name": "u.full_name ASC",
+    }
 
-    result = await db.execute(
-        text(f"""
-            SELECT {distinct} p.id AS patient_id, p.user_id, p.abha_id, p.date_of_birth,
-                   p.gender, p.blood_group, p.risk_score, p.address,
-                   p.emergency_contact_name, p.emergency_contact_phone,
-                   u.full_name, u.email, u.phone, u.is_active, u.created_at,
-                   (SELECT COUNT(*) FROM appointments a WHERE a.patient_id = p.id) AS total_appointments,
-                   (SELECT COUNT(*) FROM appointments a WHERE a.patient_id = p.id AND a.status = 'no_show') AS no_shows
-            FROM patients p
-            JOIN users u ON p.user_id = u.id
-            {joins}
-            {where}
-            ORDER BY p.risk_score DESC, u.full_name
-            LIMIT :limit OFFSET :offset
-        """),
-        params,
-    )
-    return [{k: str(v) if v is not None else None for k, v in r.items()} for r in result.mappings().all()]
+    import logging
+    _logger = logging.getLogger(__name__)
+    try:
+        result = await db.execute(
+            text(f"""
+                SELECT {distinct} p.id AS patient_id, p.user_id, p.abha_id, p.date_of_birth,
+                       p.gender, p.blood_group, p.risk_score, p.address,
+                       p.emergency_contact_name, p.emergency_contact_phone,
+                       u.full_name, u.email, u.phone, u.is_active, u.created_at,
+                       COALESCE(u.password_hash, '') = 'FAMILY_NO_LOGIN' AS is_beneficiary,
+                       (SELECT u2.full_name FROM patient_relationships pr2
+                        JOIN patients p2 ON pr2.booker_patient_id = p2.id
+                        JOIN users u2 ON p2.user_id = u2.id
+                        WHERE pr2.beneficiary_patient_id = p.id
+                          AND pr2.relationship_type != 'self'
+                          AND pr2.booker_patient_id != p.id
+                        LIMIT 1) AS added_by,
+                       (SELECT pr2.relationship_type FROM patient_relationships pr2
+                        WHERE pr2.beneficiary_patient_id = p.id
+                          AND pr2.relationship_type != 'self'
+                          AND pr2.booker_patient_id != p.id
+                        LIMIT 1) AS added_as,
+                       (SELECT COUNT(*) FROM appointments a WHERE a.patient_id = p.id) AS total_appointments,
+                       (SELECT COUNT(*) FROM appointments a WHERE a.patient_id = p.id AND a.status = 'no_show') AS no_shows
+                FROM patients p
+                JOIN users u ON p.user_id = u.id
+                {joins}
+                {where}
+                ORDER BY {_sort_map.get(sort_by or "", "u.created_at DESC")}
+                LIMIT :limit OFFSET :offset
+            """),
+            params,
+        )
+        return [{k: str(v) if v is not None else None for k, v in r.items()} for r in result.mappings().all()]
+    except Exception as e:
+        _logger.error(f"list_patients query failed: {e}", exc_info=True)
+        raise
 
 
 @router.put("/patients/{patient_id}/reset-risk")
 async def reset_patient_risk(
     patient_id: str,
     body: ResetRiskRequest,
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "nurse")),
     db: AsyncSession = Depends(get_db),
 ):
-    """Reset a patient's risk score (admin override)."""
+    """Reset a patient's risk score (admin/nurse override)."""
     result = await db.execute(
         text("UPDATE patients SET risk_score = :score WHERE id = :id RETURNING id"),
         {"id": UUID(patient_id), "score": body.new_score},
@@ -725,9 +759,201 @@ async def admin_update_patient(
     }
 
 
+# ─── POST /admin/patients/{patient_id}/add-beneficiary ──────
+
+@router.post("/patients/{patient_id}/add-beneficiary")
+async def admin_add_beneficiary(
+    patient_id: str,
+    body: dict,
+    user: User = Depends(require_role("admin", "nurse")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Add a family member (beneficiary) to a patient.
+
+    Body:
+      - beneficiary_name (required): full name
+      - relationship_type (required): parent, child, spouse, sibling, other
+      - custom_relationship (optional): free-text if relationship_type == 'other'
+      - phone, gender, date_of_birth, blood_group, abha_id (optional)
+    """
+    import uuid as _uuid
+    from datetime import date as _date_type
+    from go.models.patient_relationship import RelationshipModel
+
+    pid = UUID(patient_id)
+
+    # Validate booker exists
+    check = await db.execute(text("SELECT id FROM patients WHERE id = :pid"), {"pid": pid})
+    if not check.first():
+        raise HTTPException(404, "Booker patient not found")
+
+    b_name = (body.get("beneficiary_name") or "").strip()
+    rel_type = (body.get("relationship_type") or "").strip().lower()
+    if not b_name or len(b_name) < 2:
+        raise HTTPException(400, "beneficiary_name is required (min 2 chars)")
+    if not rel_type:
+        raise HTTPException(400, "relationship_type is required")
+
+    # If 'other', use the custom text
+    if rel_type == "other":
+        custom = (body.get("custom_relationship") or "").strip()
+        if custom:
+            rel_type = custom
+
+    phone = (body.get("phone") or "").strip() or None
+    gender = (body.get("gender") or "other").strip().lower()
+    dob_str = body.get("date_of_birth")
+    blood_group = body.get("blood_group") or None
+    abha_id = body.get("abha_id") or None
+
+    placeholder_email = f"family_{_uuid.uuid4().hex[:8]}@dpms.local"
+
+    # 1. Create user for beneficiary
+    new_user = await UserModel.create(
+        db,
+        email=placeholder_email,
+        full_name=b_name,
+        role="patient",
+        password_hash="FAMILY_NO_LOGIN",
+        phone=phone,
+    )
+
+    # 2. Create patient record
+    dob = None
+    if dob_str:
+        try:
+            dob = _date_type.fromisoformat(str(dob_str)[:10])
+        except Exception:
+            pass
+    new_patient = await PatientModel.create(
+        db,
+        user_id=new_user.id,
+        date_of_birth=dob or _date_type(2000, 1, 1),
+        gender=gender,
+    )
+
+    # Update optional fields
+    extra_sets = []
+    extra_params = {"bpid": new_patient.id}
+    if blood_group:
+        extra_sets.append("blood_group = :bg")
+        extra_params["bg"] = blood_group
+    if abha_id:
+        extra_sets.append("abha_id = :abha")
+        extra_params["abha"] = abha_id
+    if extra_sets:
+        await db.execute(
+            text(f"UPDATE patients SET {', '.join(extra_sets)} WHERE id = :bpid"),
+            extra_params,
+        )
+
+    # 3. Self-relationship for the new beneficiary
+    try:
+        await RelationshipModel.create(db, new_patient.id, new_patient.id, "self")
+    except Exception:
+        pass
+
+    # 4. Link booker → beneficiary (auto-approved by admin)
+    await db.execute(
+        text("""
+            INSERT INTO patient_relationships
+                (booker_patient_id, beneficiary_patient_id, relationship_type, is_approved, approved_at)
+            VALUES (:booker, :beneficiary, :rel_type, true, NOW())
+        """),
+        {"booker": pid, "beneficiary": new_patient.id, "rel_type": rel_type},
+    )
+
+    await db.commit()
+
+    return {
+        "message": f"Added {b_name} as {rel_type} of patient",
+        "beneficiary_patient_id": str(new_patient.id),
+        "relationship_type": rel_type,
+    }
+
+
 # ═══════════════════════════════════════════════════════════
-# SESSION OVERVIEW
+# SESSION OVERVIEW + EDIT
 # ═══════════════════════════════════════════════════════════
+
+
+@router.put("/sessions/{session_id}/update")
+async def admin_update_session(
+    session_id: str,
+    body: dict,
+    user: User = Depends(require_role("admin", "nurse")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update session fields: start_time, end_time, slot_duration_minutes,
+    max_patients_per_slot, notes. Recalculates total_slots if times or duration change."""
+    from datetime import time as _time_cls
+
+    sid = UUID(session_id)
+    row = await db.execute(text("SELECT * FROM sessions WHERE id = :sid"), {"sid": sid})
+    session = row.mappings().first()
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    updates = []
+    params = {"sid": sid}
+
+    # Parse optional time fields
+    new_start = session["start_time"]
+    new_end = session["end_time"]
+    new_dur = session["slot_duration_minutes"]
+
+    if "start_time" in body:
+        try:
+            h, m = body["start_time"].split(":")
+            new_start = _time_cls(int(h), int(m))
+            updates.append("start_time = :st")
+            params["st"] = new_start
+        except Exception:
+            raise HTTPException(400, "Invalid start_time format. Use HH:MM.")
+    if "end_time" in body:
+        try:
+            h, m = body["end_time"].split(":")
+            new_end = _time_cls(int(h), int(m))
+            updates.append("end_time = :et")
+            params["et"] = new_end
+        except Exception:
+            raise HTTPException(400, "Invalid end_time format. Use HH:MM.")
+    if "slot_duration_minutes" in body:
+        new_dur = int(body["slot_duration_minutes"])
+        if new_dur < 5 or new_dur > 60:
+            raise HTTPException(400, "slot_duration_minutes must be 5–60")
+        updates.append("slot_duration_minutes = :dur")
+        params["dur"] = new_dur
+    if "max_patients_per_slot" in body:
+        mpps = int(body["max_patients_per_slot"])
+        if mpps < 1 or mpps > 10:
+            raise HTTPException(400, "max_patients_per_slot must be 1–10")
+        updates.append("max_patients_per_slot = :mpps")
+        params["mpps"] = mpps
+    if "notes" in body:
+        updates.append("notes = :notes")
+        params["notes"] = (body["notes"] or "").strip() or None
+
+    # Recalculate total_slots if time or duration changed
+    if any(k in body for k in ("start_time", "end_time", "slot_duration_minutes")):
+        st_min = new_start.hour * 60 + new_start.minute
+        et_min = new_end.hour * 60 + new_end.minute
+        if et_min <= st_min:
+            raise HTTPException(400, "end_time must be after start_time")
+        new_total = (et_min - st_min) // new_dur
+        updates.append("total_slots = :total_slots")
+        params["total_slots"] = new_total
+
+    if not updates:
+        return {"message": "No changes."}
+
+    await db.execute(
+        text(f"UPDATE sessions SET {', '.join(updates)} WHERE id = :sid"),
+        params,
+    )
+    await db.commit()
+    return {"message": "Session updated", "session_id": session_id}
+
 
 @router.get("/sessions")
 async def list_all_sessions(
@@ -735,7 +961,7 @@ async def list_all_sessions(
     status: Optional[str] = Query(None, description="Filter by status"),
     specialization: Optional[str] = Query(None, description="Filter by department"),
     doctor_id: Optional[str] = Query(None, description="Filter by doctor"),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "nurse")),
     db: AsyncSession = Depends(get_db),
 ):
     """All sessions across all doctors."""
@@ -765,7 +991,7 @@ async def list_all_sessions(
             SELECT s.id, s.session_date, s.start_time, s.end_time,
                    s.slot_duration_minutes, s.max_patients_per_slot, s.total_slots,
                    s.booked_count, s.delay_minutes, s.status, s.notes, s.created_at,
-                   d.id AS doctor_id, d.specialization,
+                   d.id AS doctor_id, d.specialization, d.is_available AS doctor_available,
                    u.full_name AS doctor_name,
                    (SELECT COUNT(*) FROM appointments a
                     WHERE a.session_id = s.id AND a.status != 'cancelled') AS active_appointments

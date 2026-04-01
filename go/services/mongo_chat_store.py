@@ -47,7 +47,9 @@ async def ensure_indexes():
     db = _get_db()
     await db.chat_messages.create_index([("session_id", 1), ("seq", 1)])
     await db.chat_messages.create_index([("session_id", 1), ("created_at", 1)])
-    await db.chat_sessions.create_index("session_id", unique=True)
+    await db.chat_sessions.create_index([("session_id", 1)], unique=True)
+    await db.chat_ui_history.create_index([("user_id", 1), ("created_at", 1)])
+    await db.chat_seq_counters.create_index([("session_id", 1)], unique=True)
     logger.info("[MongoDB] Chat indexes ensured")
 
 
@@ -90,15 +92,17 @@ class MongoSession:
             upsert=True,
         )
 
-    async def _next_seq(self) -> int:
-        """Get the next sequence number for this session's messages."""
+    async def _next_seq(self, count: int = 1) -> int:
+        """Atomically reserve the next `count` sequence numbers for this session."""
         db = _get_db()
-        last = await db.chat_messages.find_one(
+        result = await db.chat_seq_counters.find_one_and_update(
             {"session_id": self.session_id},
-            sort=[("seq", -1)],
-            projection={"seq": 1},
+            {"$inc": {"seq": count}},
+            upsert=True,
+            return_document=True,
         )
-        return (last["seq"] + 1) if last else 1
+        # Returns the AFTER value, so first reserved seq = result - count + 1
+        return result["seq"] - count + 1
 
     async def get_items(self, limit: Optional[int] = None) -> list:
         """Retrieve conversation history for this session.
@@ -140,7 +144,7 @@ class MongoSession:
 
         await self._ensure_session()
         db = _get_db()
-        seq = await self._next_seq()
+        seq = await self._next_seq(count=len(items))
         now = datetime.now(timezone.utc)
 
         docs = []
@@ -157,19 +161,15 @@ class MongoSession:
             await db.chat_messages.insert_many(docs)
 
     async def pop_item(self) -> Optional[dict]:
-        """Remove and return the most recent item."""
+        """Atomically remove and return the most recent item."""
         db = _get_db()
 
-        # Find the latest message
-        last = await db.chat_messages.find_one(
+        last = await db.chat_messages.find_one_and_delete(
             {"session_id": self.session_id},
             sort=[("seq", -1)],
         )
         if not last:
             return None
-
-        # Delete it
-        await db.chat_messages.delete_one({"_id": last["_id"]})
 
         raw = last["message_data"]
         if isinstance(raw, str):
@@ -177,65 +177,48 @@ class MongoSession:
         return raw
 
     async def clear_session(self) -> None:
-        """Delete all messages and the session record."""
+        """Delete all messages, seq counter, and the session record."""
         db = _get_db()
         await db.chat_messages.delete_many({"session_id": self.session_id})
+        await db.chat_seq_counters.delete_one({"session_id": self.session_id})
         await db.chat_sessions.delete_one({"session_id": self.session_id})
         logger.info(f"[MongoDB] Cleared session {self.session_id}")
 
 
-# ─── History retrieval (for /chat/history endpoint) ──────────
+# ─── UI Chat History (separate from SDK session) ──────────────
+#
+# The SDK session stores complex response objects that get compacted/summarized.
+# Parsing those back into clean {role, content} is unreliable — compaction
+# fragments old messages, tool-call items pollute the list, etc.
+#
+# Instead, we keep a simple parallel collection `chat_ui_history` that stores
+# exactly what the user sees: {user_id, role, content, created_at}.
+# This is written by the chat API on every send/receive and read on page load.
 
-async def get_conversation_history_mongo(user_id: str, limit: int = 100) -> list[dict]:
-    """Retrieve stored conversation history for a user from MongoDB.
+async def save_ui_message(user_id: str, role: str, content: str) -> None:
+    """Append one message to the UI history (call for both user + assistant)."""
+    db = _get_db()
+    await db.chat_ui_history.insert_one({
+        "user_id": user_id,
+        "role": role,
+        "content": content,
+        "created_at": datetime.now(timezone.utc),
+    })
 
-    Returns a list of {role: 'user'|'assistant', content: str} dicts
-    suitable for displaying in the Streamlit chat UI.
-    Strips [MANDATORY:...] and [SYSTEM REMINDER:...] prefixes from user messages.
-    """
-    import re
 
-    try:
-        session = MongoSession(session_id=user_id)
-        items = await session.get_items(limit=limit)
-        messages = []
+async def get_ui_history(user_id: str, limit: int = 50) -> list[dict]:
+    """Retrieve clean UI-friendly messages (most recent `limit`)."""
+    db = _get_db()
+    total = await db.chat_ui_history.count_documents({"user_id": user_id})
+    skip = max(0, total - limit)
+    cursor = db.chat_ui_history.find(
+        {"user_id": user_id},
+        projection={"_id": 0, "role": 1, "content": 1},
+    ).sort("created_at", 1).skip(skip)
+    return [doc async for doc in cursor]
 
-        for item in items:
-            # Handle both dict and JSON string
-            if isinstance(item, str):
-                try:
-                    item = json.loads(item)
-                except json.JSONDecodeError:
-                    continue
 
-            role = item.get("role", "")
-            content_parts = item.get("content", [])
-
-            # Extract text from content parts
-            text = ""
-            if isinstance(content_parts, str):
-                text = content_parts
-            elif isinstance(content_parts, list):
-                for part in content_parts:
-                    if isinstance(part, dict):
-                        if part.get("type") in ("input_text", "output_text", "text"):
-                            text += part.get("text", "")
-                    elif isinstance(part, str):
-                        text += part
-
-            if text and role in ("user", "assistant"):
-                # Strip injected system reminders from user messages
-                if role == "user":
-                    text = re.sub(r'\[MANDATORY:.*?\]\n*', '', text, flags=re.DOTALL).strip()
-                    text = re.sub(r'\[SYSTEM REMINDER:.*?\]\n*', '', text, flags=re.DOTALL).strip()
-                    # Also strip [Form Context]...[User Message] wrapper
-                    form_match = re.search(r'\[User Message\]\s*(.*)', text, flags=re.DOTALL)
-                    if form_match:
-                        text = form_match.group(1).strip()
-                if text:
-                    messages.append({"role": role, "content": text})
-
-        return messages
-    except Exception as e:
-        logger.warning(f"[MongoDB] Could not retrieve history for {user_id}: {e}")
-        return []
+async def clear_ui_history(user_id: str) -> None:
+    """Wipe the UI history for a user (called on New Chat / Clear Chat)."""
+    db = _get_db()
+    await db.chat_ui_history.delete_many({"user_id": user_id})

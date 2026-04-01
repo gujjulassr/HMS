@@ -19,7 +19,7 @@ from fastapi.security import OAuth2PasswordBearer
 from dependencies import get_current_user
 from go.models.user import User
 from api.schemas.chat_schemas import ChatMessageRequest, ChatMessageResponse
-from go.services.chat_agent import run_chat, clear_conversation, get_conversation_history
+from go.services.chat import run_chat, clear_conversation, get_conversation_history, save_message
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -66,15 +66,29 @@ async def send_message(
                 if doctor:
                     doctor_id = str(doctor.id)
 
+        uid = str(user.id)
+
+        # Save user message to UI history (best-effort — don't block chat)
+        try:
+            await save_message(uid, "user", req.message)
+        except Exception as e:
+            logger.error(f"Failed to save user message to UI history: {e}")
+
         reply = await run_chat(
             message=req.message,
             token=token,
             role=user.role,
-            user_id=str(user.id),
+            user_id=uid,
             patient_id=patient_id,
             doctor_id=doctor_id,
             patient_context=req.patient_context or "",
         )
+
+        # Save assistant reply to UI history (best-effort)
+        try:
+            await save_message(uid, "assistant", reply)
+        except Exception as e:
+            logger.error(f"Failed to save assistant reply to UI history: {e}")
 
         return ChatMessageResponse(
             reply=reply,

@@ -125,6 +125,20 @@ async def book_appointment(
     if session.status != "active":
         raise ValueError(f"Session is {session.status}, not bookable")
 
+    # Block booking in past sessions or past time slots
+    from datetime import date as _bk_date, datetime as _bk_dt
+    _today = _bk_date.today()
+    if session.session_date < _today:
+        raise ValueError("Cannot book an appointment for a past date.")
+    if session.session_date == _today and not is_emergency:
+        _now_min = _bk_dt.now().hour * 60 + _bk_dt.now().minute
+        _slot_start = (
+            session.start_time.hour * 60 + session.start_time.minute
+            + (slot_number - 1) * session.slot_duration_minutes
+        )
+        if _slot_start <= _now_min:
+            raise ValueError("Cannot book a time slot that has already passed.")
+
     # Validate slot number
     if slot_number < 1 or slot_number > session.total_slots:
         raise ValueError(f"Invalid slot number. Must be 1-{session.total_slots}")

@@ -1,75 +1,19 @@
-"""
-DPMS — AI Chatbot Agent Service (OpenAI Agents SDK)
-=====================================================
-One agent per role. No sub-agents, no handoffs.
-Each role gets exactly the tools that match its dashboard capabilities.
+"""Chat tools — function_tool definitions for all roles.
+
+Tools are organized by capability and grouped into tool sets.
+Each role gets a specific combination of these tool groups.
 """
 
-import json
 import logging
-import os
 from datetime import date
-from typing import Optional
 
-import httpx
-from agents import Agent, Runner, function_tool, RunContextWrapper
-from agents.memory import OpenAIResponsesCompactionSession
+from agents import function_tool, RunContextWrapper
 
-from config import get_settings
+from go.services.chat._client import (
+    _api, _j, _parse_hhmm, _fmt_hhmm, _next_available_slot_min, _resolve_preferred_time_to_slot,
+)
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
-
-# ─── Internal API client ─────────────────────────────────────
-API_BASE = "http://localhost:8000/api"
-
-
-def _clear_proxy_env():
-    """Remove proxy env vars that break httpx (socks5h not supported)."""
-    for v in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy",
-              "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"):
-        os.environ.pop(v, None)
-
-
-async def _api(
-    method: str, path: str, token: str,
-    payload: dict | None = None, params: dict | None = None,
-) -> dict:
-    """Authenticated call to FastAPI backend."""
-    _clear_proxy_env()
-    headers = {"Authorization": f"Bearer {token}"}
-    url = f"{API_BASE}{path}"
-    try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            if method == "GET":
-                r = await client.get(url, headers=headers, params=params)
-            elif method == "POST":
-                r = await client.post(url, headers=headers, json=payload)
-            elif method == "PUT":
-                r = await client.put(url, headers=headers, json=payload)
-            else:
-                return {"error": f"Unsupported method: {method}"}
-            if r.status_code >= 400:
-                try:
-                    err = r.json()
-                except Exception:
-                    err = r.text
-                return {"error": str(err), "status_code": r.status_code}
-            return r.json()
-    except httpx.ConnectError as e:
-        logger.error(f"API connection error for {url}: {e}")
-        return {"error": f"Cannot connect to backend at {url}. Is the server running?"}
-    except httpx.TimeoutException:
-        logger.error(f"API timeout for {url}")
-        return {"error": f"Request timed out for {url}"}
-    except Exception as e:
-        logger.error(f"API call error for {url}: {e}", exc_info=True)
-        return {"error": f"API call failed: {type(e).__name__}: {e}"}
-
-
-def _j(obj) -> str:
-    """JSON-serialize for agent output."""
-    return json.dumps(obj, default=str)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -79,9 +23,7 @@ def _j(obj) -> str:
 @function_tool
 async def list_departments(ctx: RunContextWrapper) -> str:
     """List all hospital departments/specializations."""
-    result = await _api("GET", "/appointments/departments", ctx.context["token"])
-    logger.info(f"list_departments result: {str(result)[:300]}")
-    return _j(result)
+    return _j(await _api("GET", "/appointments/departments", ctx.context["token"]))
 
 
 @function_tool
@@ -99,10 +41,7 @@ async def list_doctors(ctx: RunContextWrapper, specialization: str = "",
         params["specialization"] = specialization
     if include_unavailable:
         params["include_unavailable"] = "true"
-    logger.info(f"list_doctors called: specialization='{specialization}', include_unavailable={include_unavailable}, token present={bool(ctx.context.get('token'))}")
     result = await _api("GET", "/doctors", ctx.context["token"], params=params)
-    logger.info(f"list_doctors result type={type(result).__name__}, is_list={isinstance(result, list)}, "
-                f"content_preview={str(result)[:200]}")
     if isinstance(result, list):
         return _j([{
             "doctor_id": d.get("doctor_id") or d.get("id"),
@@ -134,77 +73,84 @@ async def get_doctor_sessions(ctx: RunContextWrapper, doctor_id: str) -> str:
     """
     from datetime import datetime as _dt
     token = ctx.context["token"]
-    params = {"date_from": date.today().isoformat(), "include_all": "true"}
-    logger.info(f"get_doctor_sessions called: doctor_id='{doctor_id}'")
-    result = await _api("GET", f"/doctors/{doctor_id}/sessions", token, params=params)
-    logger.info(f"get_doctor_sessions result: type={type(result).__name__}, preview={str(result)[:300]}")
-    if isinstance(result, list):
-        sessions = []
-        now = _dt.now()
-        now_min = now.hour * 60 + now.minute
-        today_str = date.today().isoformat()
-        for s in result:
-            sid = s.get("session_id") or s.get("id")
-            sess_date = s.get("session_date", "")
-            start_str = s.get("start_time", "")
-            end_str = s.get("end_time", "")
-            total = s.get("total_slots", 0)
-            booked = s.get("booked_count", 0)
-            max_per = s.get("max_patients_per_slot", 2)
-            available = max(total * max_per - booked, 0)
+    result = await _api("GET", f"/doctors/{doctor_id}/sessions", token,
+                        params={"date_from": date.today().isoformat(), "include_all": "true"})
+    if not isinstance(result, list):
+        return _j(result)
 
-            # Check if session time has already passed (only for today)
-            time_passed = False
-            if str(sess_date) == today_str and end_str:
+    now = _dt.now()
+    now_min = now.hour * 60 + now.minute
+    today_str = date.today().isoformat()
+    sessions = []
+
+    for s in result:
+        sid = s.get("session_id") or s.get("id")
+        sess_date = str(s.get("session_date", ""))
+        start_str = s.get("start_time", "")
+        end_str = s.get("end_time", "")
+        total = s.get("total_slots", 0)
+        booked = s.get("booked_count", 0)
+        max_per = s.get("max_patients_per_slot", 2)
+        dur = s.get("slot_duration_minutes", 15)
+        is_today = sess_date == today_str
+
+        available = max(total * max_per - booked, 0)
+        time_passed = False
+        next_available_time = start_str
+
+        if is_today:
+            # Session fully ended?
+            try:
+                if end_str and now_min > _parse_hhmm(end_str):
+                    time_passed = True
+            except Exception:
+                pass
+
+            # For still-active today sessions: find next bookable slot,
+            # cap available to future capacity only
+            if not time_passed and start_str:
                 try:
-                    eh, em = int(str(end_str)[:2]), int(str(end_str)[3:5])
-                    if now_min > eh * 60 + em:
-                        time_passed = True
+                    start_min = _parse_hhmm(start_str)
+                    # Count past slots in one pass
+                    past = 0
+                    t = start_min
+                    while t <= now_min and past < total:
+                        past += 1
+                        t += dur
+                    next_available_time = _fmt_hhmm(t)
+                    remaining = max(total - past, 0) * max_per
+                    available = min(available, remaining)
                 except Exception:
                     pass
 
-            # Calculate next available slot time (for today's active sessions)
-            next_available_time = start_str  # default to session start
-            if str(sess_date) == today_str and not time_passed:
-                try:
-                    sh, sm = int(str(start_str)[:2]), int(str(start_str)[3:5])
-                    s_total = sh * 60 + sm
-                    dur = s.get("slot_duration_minutes", 15)
-                    next_min = s_total
-                    while next_min <= now_min:
-                        next_min += dur
-                    nh, nm = divmod(next_min, 60)
-                    next_available_time = f"{nh:02d}:{nm:02d}"
-                except Exception:
-                    pass
+        info = {
+            "session_id": sid,
+            "date": sess_date, "start": start_str, "end": end_str,
+            "status": s.get("status"),
+            "total_slots": total,
+            "available_slots": available,
+            "time_passed": time_passed,
+            "next_available_time": next_available_time,
+        }
 
-            info = {
-                "session_id": sid,
-                "date": sess_date, "start": start_str, "end": end_str,
-                "status": s.get("status"),
-                "total_slots": total,
-                "available_slots": available,
-                "time_passed": time_passed,
-                "next_available_time": next_available_time,
-            }
-            # For active/today sessions, include full patient list
-            if s.get("status") == "active" and sid:
-                try:
-                    q = await _api("GET", f"/queue/{sid}", token)
-                    queue = q.get("queue", [])
-                    active = [e for e in queue if e.get("status") not in ("cancelled", "no_show")]
-                    info["patients"] = [{
-                        "name": e.get("patient_name"), "status": e.get("status"),
-                        "priority": e.get("priority_tier"), "is_emergency": e.get("is_emergency"),
-                        "slot": e.get("slot_number"), "appointment_id": e.get("appointment_id"),
-                    } for e in active]
-                    info["patient_count"] = len(active)
-                except Exception:
-                    info["patients"] = []
-                    info["patient_count"] = 0
-            sessions.append(info)
-        return _j(sessions)
-    return _j(result)
+        # For active sessions, include the queue
+        if s.get("status") == "active" and sid:
+            try:
+                q = await _api("GET", f"/queue/{sid}", token)
+                active = [e for e in q.get("queue", [])
+                          if e.get("status") not in ("cancelled", "no_show")]
+                info["patients"] = [{
+                    "name": e.get("patient_name"), "status": e.get("status"),
+                    "priority": e.get("priority_tier"), "is_emergency": e.get("is_emergency"),
+                    "slot": e.get("slot_number"), "appointment_id": e.get("appointment_id"),
+                } for e in active]
+                info["patient_count"] = len(active)
+            except Exception:
+                info["patients"] = []
+                info["patient_count"] = 0
+
+        sessions.append(info)
+    return _j(sessions)
 
 
 @function_tool
@@ -242,48 +188,10 @@ async def book_appointment(ctx: RunContextWrapper, session_id: str, preferred_ti
     # If preferred_time is given, compute the correct slot_number from session details
     if preferred_time and slot_number <= 0:
         try:
-            # Fetch session details to get start_time and slot_duration
-            session_data = await _api("GET", f"/sessions/{session_id}", ctx.context["token"])
-            if isinstance(session_data, dict) and "error" not in session_data:
-                start_str = session_data.get("start_time", "")
-                duration = session_data.get("slot_duration_minutes", 15)
-                total_slots = session_data.get("total_slots", 0)
-                sess_date = str(session_data.get("session_date", ""))
-
-                # Parse start_time (could be "HH:MM" or "HH:MM:SS")
-                start_parts = str(start_str).split(":")
-                start_h, start_m = int(start_parts[0]), int(start_parts[1])
-                start_total = start_h * 60 + start_m
-
-                # Parse preferred_time
-                pref_parts = preferred_time.strip().split(":")
-                pref_h, pref_m = int(pref_parts[0]), int(pref_parts[1]) if len(pref_parts) > 1 else 0
-                pref_total = pref_h * 60 + pref_m
-
-                # Reject if requested time is in the past (for today's sessions)
-                from datetime import datetime as _dt
-                now = _dt.now()
-                if sess_date == now.strftime("%Y-%m-%d"):
-                    now_total = now.hour * 60 + now.minute
-                    if pref_total <= now_total:
-                        now_hh, now_mm = divmod(now_total, 60)
-                        # Calculate next available slot time
-                        next_slot_min = start_total
-                        while next_slot_min <= now_total:
-                            next_slot_min += duration
-                        next_hh, next_mm = divmod(next_slot_min, 60)
-                        return _j({"error": f"Cannot book at {preferred_time} — that time has already passed. Current time is {now_hh:02d}:{now_mm:02d}. The next available slot is at {next_hh:02d}:{next_mm:02d}."})
-
-                # Calculate slot number: (time_diff / duration) + 1
-                diff = pref_total - start_total
-                if diff >= 0:
-                    slot_number = (diff // duration) + 1
-                    if slot_number > total_slots:
-                        return _j({"error": f"Time {preferred_time} is outside session hours. Max slot is {total_slots}."})
-                else:
-                    return _j({"error": f"Time {preferred_time} is before session start ({start_str})."})
-            else:
-                return _j({"error": f"Could not fetch session details: {session_data}"})
+            res = await _resolve_preferred_time_to_slot(preferred_time, session_id, ctx.context["token"])
+            if "error" in res:
+                return _j(res)
+            slot_number = res["slot_number"]
         except Exception as e:
             logger.error(f"book_appointment time conversion failed: {e}", exc_info=True)
             return _j({"error": f"Could not convert time '{preferred_time}' to slot: {e}"})
@@ -322,7 +230,8 @@ async def get_my_appointments(ctx: RunContextWrapper) -> str:
     Returns appointments where you are the patient OR the booker.
     Check 'booked_for' field: 'self' means your own appointment,
     otherwise it shows the beneficiary's name (family member).
-    Includes session details: slot_time, delay, queue info."""
+    IMPORTANT: 'appointment_time' is the ACTUAL scheduled time (e.g. "16:30").
+    ALWAYS show appointment_time to the user — NOT session_start."""
     my_pid = ctx.context.get("patient_id", "")
     result = await _api("GET", "/appointments/my", ctx.context["token"])
     if isinstance(result, list):
@@ -337,15 +246,30 @@ async def get_my_appointments(ctx: RunContextWrapper) -> str:
                 booked_for = "self"
             else:
                 booked_for = patient_name or "family member"
+
+            # appointment_time is the ACTUAL time the patient should arrive
+            raw_appt_time = a.get("slot_time")
+            if raw_appt_time and raw_appt_time != "Emergency":
+                # Convert to 12-hour format for clarity: "16:30" → "04:30 PM"
+                try:
+                    hh, mm = int(raw_appt_time[:2]), int(raw_appt_time[3:5])
+                    period = "AM" if hh < 12 else "PM"
+                    display_hh = hh if hh <= 12 else hh - 12
+                    if display_hh == 0:
+                        display_hh = 12
+                    appt_time = f"{display_hh}:{mm:02d} {period} ({raw_appt_time})"
+                except Exception:
+                    appt_time = raw_appt_time
+            else:
+                appt_time = raw_appt_time  # "Emergency" or None
+
             appointments.append({
                 "id": a.get("appointment_id"),
                 "doctor": a.get("doctor_name"),
                 "specialization": a.get("specialization"),
                 "date": a.get("session_date"),
-                "session_start": a.get("start_time"),
-                "session_end": a.get("end_time"),
+                "appointment_time": appt_time,
                 "slot": a.get("slot_number"),
-                "slot_time": a.get("slot_time"),
                 "delay_minutes": a.get("delay_minutes", 0),
                 "status": a.get("status"),
                 "priority_tier": a.get("priority_tier"),
@@ -985,42 +909,10 @@ async def reassign_appointment(ctx: RunContextWrapper, appointment_id: str, targ
     # If preferred_time given, auto-compute slot from session details
     if preferred_time and target_slot_number <= 0:
         try:
-            session_data = await _api("GET", f"/sessions/{target_session_id}", ctx.context["token"])
-            if isinstance(session_data, dict) and "error" not in session_data:
-                start_str = session_data.get("start_time", "")
-                duration = session_data.get("slot_duration_minutes", 15)
-                total_slots = session_data.get("total_slots", 0)
-                sess_date = str(session_data.get("session_date", ""))
-
-                start_parts = str(start_str).split(":")
-                start_h, start_m = int(start_parts[0]), int(start_parts[1])
-                start_total = start_h * 60 + start_m
-
-                pref_parts = preferred_time.strip().split(":")
-                pref_h, pref_m = int(pref_parts[0]), int(pref_parts[1]) if len(pref_parts) > 1 else 0
-                pref_total = pref_h * 60 + pref_m
-
-                # Reject if requested time is in the past (for today's sessions)
-                from datetime import datetime as _dt
-                now = _dt.now()
-                if sess_date == now.strftime("%Y-%m-%d"):
-                    now_total = now.hour * 60 + now.minute
-                    if pref_total <= now_total:
-                        next_slot_min = start_total
-                        while next_slot_min <= now_total:
-                            next_slot_min += duration
-                        next_hh, next_mm = divmod(next_slot_min, 60)
-                        return _j({"error": f"Cannot reschedule to {preferred_time} — that time has already passed. Current time is {now.hour:02d}:{now.minute:02d}. The next available slot is at {next_hh:02d}:{next_mm:02d}."})
-
-                diff = pref_total - start_total
-                if diff >= 0:
-                    target_slot_number = (diff // duration) + 1
-                    if target_slot_number > total_slots:
-                        return _j({"error": f"Time {preferred_time} is outside session hours. Max slot is {total_slots}."})
-                else:
-                    return _j({"error": f"Time {preferred_time} is before session start ({start_str})."})
-            else:
-                return _j({"error": f"Could not fetch session details: {session_data}"})
+            res = await _resolve_preferred_time_to_slot(preferred_time, target_session_id, ctx.context["token"])
+            if "error" in res:
+                return _j(res)
+            target_slot_number = res["slot_number"]
         except Exception as e:
             logger.error(f"reassign_appointment time conversion failed: {e}", exc_info=True)
             return _j({"error": f"Could not convert time '{preferred_time}' to slot: {e}"})
@@ -1170,6 +1062,175 @@ async def admin_update_config(ctx: RunContextWrapper, key: str, value: str) -> s
     return _j(await _api("PUT", f"/admin/config/{key}", ctx.context["token"], payload={"value": value}))
 
 
+@function_tool
+async def admin_list_doctors(ctx: RunContextWrapper, specialization: str = "") -> str:
+    """List all doctors with full details including availability, fees, qualification.
+    Args:
+        specialization: Filter by department. Empty = all doctors.
+    """
+    params = {}
+    if specialization:
+        params["specialization"] = specialization
+    return _j(await _api("GET", "/admin/doctors", ctx.context["token"], params=params))
+
+
+@function_tool
+async def admin_update_doctor(ctx: RunContextWrapper, doctor_id: str,
+                               specialization: str = "", qualification: str = "",
+                               license_number: str = "", consultation_fee: float = 0,
+                               max_patients_per_slot: int = 0,
+                               is_available: bool | None = None) -> str:
+    """Update a doctor's settings (specialization, fee, availability, etc.).
+    Args:
+        doctor_id: UUID of the doctor.
+        specialization: New specialization. Empty = no change.
+        qualification: New qualification. Empty = no change.
+        license_number: New license. Empty = no change.
+        consultation_fee: New fee. 0 = no change.
+        max_patients_per_slot: New max. 0 = no change.
+        is_available: Set availability. None = no change.
+    """
+    payload = {}
+    if specialization:
+        payload["specialization"] = specialization
+    if qualification:
+        payload["qualification"] = qualification
+    if license_number:
+        payload["license_number"] = license_number
+    if consultation_fee:
+        payload["consultation_fee"] = consultation_fee
+    if max_patients_per_slot:
+        payload["max_patients_per_slot"] = max_patients_per_slot
+    if is_available is not None:
+        payload["is_available"] = is_available
+    if not payload:
+        return _j({"error": "No fields to update"})
+    return _j(await _api("PUT", f"/admin/doctors/{doctor_id}", ctx.context["token"], payload=payload))
+
+
+@function_tool
+async def admin_update_user(ctx: RunContextWrapper, user_id: str,
+                             full_name: str = "", email: str = "", phone: str = "") -> str:
+    """Update a user's personal details (name, email, phone).
+    Args:
+        user_id: UUID of the user.
+        full_name: New name. Empty = no change.
+        email: New email. Empty = no change.
+        phone: New phone. Empty = no change.
+    """
+    payload = {}
+    if full_name:
+        payload["full_name"] = full_name
+    if email:
+        payload["email"] = email
+    if phone:
+        payload["phone"] = phone
+    if not payload:
+        return _j({"error": "No fields to update"})
+    return _j(await _api("PUT", f"/admin/users/{user_id}", ctx.context["token"], payload=payload))
+
+
+@function_tool
+async def admin_update_patient(ctx: RunContextWrapper, patient_id: str,
+                                full_name: str = "", phone: str = "", email: str = "",
+                                gender: str = "", blood_group: str = "",
+                                address: str = "", abha_id: str = "",
+                                emergency_contact_name: str = "",
+                                emergency_contact_phone: str = "") -> str:
+    """Update a patient's profile (name, phone, blood group, emergency contact, etc.).
+    Args:
+        patient_id: UUID of the patient.
+        full_name: New name. Empty = no change.
+        phone: New phone. Empty = no change.
+        email: New email. Empty = no change.
+        gender: Male, Female, or Other. Empty = no change.
+        blood_group: A+, A-, B+, B-, O+, O-, AB+, AB-. Empty = no change.
+        address: New address. Empty = no change.
+        abha_id: ABHA/UHID. Empty = no change.
+        emergency_contact_name: Emergency contact name. Empty = no change.
+        emergency_contact_phone: Emergency contact phone. Empty = no change.
+    """
+    payload = {}
+    for key, val in [("full_name", full_name), ("phone", phone), ("email", email),
+                     ("gender", gender), ("blood_group", blood_group), ("address", address),
+                     ("abha_id", abha_id), ("emergency_contact_name", emergency_contact_name),
+                     ("emergency_contact_phone", emergency_contact_phone)]:
+        if val:
+            payload[key] = val
+    if not payload:
+        return _j({"error": "No fields to update"})
+    return _j(await _api("PUT", f"/admin/patients/{patient_id}/update", ctx.context["token"], payload=payload))
+
+
+@function_tool
+async def admin_add_beneficiary(ctx: RunContextWrapper, patient_id: str,
+                                 beneficiary_name: str, relationship_type: str,
+                                 phone: str = "", gender: str = "other",
+                                 blood_group: str = "",
+                                 custom_relationship: str = "") -> str:
+    """Add a family member (beneficiary) to a patient.
+    Args:
+        patient_id: UUID of the patient (booker).
+        beneficiary_name: Full name of the family member.
+        relationship_type: parent, child, spouse, sibling, guardian, or other.
+        phone: Phone number. Optional.
+        gender: male, female, or other. Default other.
+        blood_group: Blood group. Optional.
+        custom_relationship: If relationship_type is 'other', specify the actual relationship (e.g. cousin, uncle).
+    """
+    payload = {"beneficiary_name": beneficiary_name, "relationship_type": relationship_type,
+               "gender": gender}
+    if phone:
+        payload["phone"] = phone
+    if blood_group:
+        payload["blood_group"] = blood_group
+    if custom_relationship:
+        payload["custom_relationship"] = custom_relationship
+    return _j(await _api("POST", f"/admin/patients/{patient_id}/add-beneficiary",
+                         ctx.context["token"], payload=payload))
+
+
+@function_tool
+async def admin_update_session(ctx: RunContextWrapper, session_id: str,
+                                start_time: str = "", end_time: str = "",
+                                slot_duration_minutes: int = 0,
+                                max_patients_per_slot: int = 0,
+                                notes: str = "") -> str:
+    """Edit a session's time, slot duration, max patients, or notes. Recalculates total slots automatically.
+    Args:
+        session_id: UUID of the session.
+        start_time: New start time HH:MM. Empty = no change.
+        end_time: New end time HH:MM. Empty = no change.
+        slot_duration_minutes: New duration per slot (5-60). 0 = no change.
+        max_patients_per_slot: New max per slot (1-10). 0 = no change.
+        notes: Session notes. Empty = no change.
+    """
+    payload = {}
+    if start_time:
+        payload["start_time"] = start_time
+    if end_time:
+        payload["end_time"] = end_time
+    if slot_duration_minutes:
+        payload["slot_duration_minutes"] = slot_duration_minutes
+    if max_patients_per_slot:
+        payload["max_patients_per_slot"] = max_patients_per_slot
+    if notes:
+        payload["notes"] = notes
+    if not payload:
+        return _j({"error": "No fields to update"})
+    return _j(await _api("PUT", f"/admin/sessions/{session_id}/update",
+                         ctx.context["token"], payload=payload))
+
+
+@function_tool
+async def admin_get_patient_detail(ctx: RunContextWrapper, patient_id: str) -> str:
+    """Get full patient details including profile, relationships, and appointments.
+    Args:
+        patient_id: UUID of the patient.
+    """
+    return _j(await _api("GET", f"/admin/patients/{patient_id}", ctx.context["token"]))
+
+
 # ─── Rating & Feedback Tools ──────────────────────────────────
 
 @function_tool
@@ -1245,450 +1306,22 @@ _SESSION_TOOLS = [create_session, activate_session, deactivate_session, doctor_c
                   complete_session, cancel_session]
 
 _STAFF_BOOK_TOOLS = [search_patients, get_patient_full_details, update_patient_details,
-                     staff_book, staff_register_and_book,
-                     emergency_book, emergency_register_and_book,
+                     staff_book,
+                     emergency_book,
                      staff_cancel_appointment, reassign_appointment]
 
-_DOCTOR_EXTRA_TOOLS = [get_my_doctor_sessions, search_patients, get_patient_full_details,
-                       update_patient_details, staff_book,
-                       staff_register_and_book, emergency_book, emergency_register_and_book,
-                       staff_cancel_appointment, reassign_appointment]
+_DOCTOR_EXTRA_TOOLS = [get_my_doctor_sessions] + _STAFF_BOOK_TOOLS
 
-_ADMIN_TOOLS = [admin_get_stats, admin_list_users, admin_create_user, admin_toggle_user,
-                admin_list_patients, admin_reset_risk, admin_get_audit,
-                admin_list_sessions, admin_get_config, admin_update_config]
+_NURSE_ADMIN_TOOLS = [admin_get_stats,
+                      admin_list_doctors,
+                      admin_list_patients, admin_get_patient_detail, admin_update_patient,
+                      admin_add_beneficiary, admin_reset_risk,
+                      admin_list_sessions, admin_update_session]
 
-
-# ═══════════════════════════════════════════════════════════════
-#  ROLE CONFIG — one agent per role, tools matching dashboard
-# ═══════════════════════════════════════════════════════════════
-
-MODEL = "gpt-4o"
-
-ROLE_CONFIG = {
-    "patient": {
-        "tools": _INFO_TOOLS + _PATIENT_TOOLS + _RATING_TOOLS,
-        "instructions": """You are the Hospital AI Assistant for PATIENTS.
-
-CRITICAL RULES:
-1. ONLY do what the patient explicitly asks. NEVER call tools or take actions unprompted.
-   - If patient says "hi" or "hello" → just greet back. Do NOT fetch appointments, doctors, or anything.
-   - NEVER auto-fetch data to "be helpful". Wait for the patient to ask.
-2. Be concise and friendly. Short natural responses, not walls of text.
-3. **NEVER answer from conversation history for real-time data.** Appointment status, session availability, queue — these change constantly. ALWAYS call tools fresh.
-4. Use tools to get REAL data — never guess doctors, sessions, or IDs.
-4. Confirm before booking or cancelling.
-5. Never provide medical diagnoses — only help with logistics.
-6. If a tool call returns an error, try an alternative tool. NEVER give up after one failure.
-   - For finding doctors: ALWAYS use list_doctors(specialization=...) first, NOT list_departments.
-
-FINDING DOCTORS (most common patient request):
-- Patient says a specialty ("cardiologist", "heart", "bone", "skin", etc.)
-  → call list_doctors(specialization="Cardiology") — use the proper medical name
-  → common mappings: heart=Cardiology, bone=Orthopedics, skin=Dermatology, brain/neuro=Neurology,
-    child/kids=Pediatrics, eye=Ophthalmology, ENT/ear/nose/throat=ENT, teeth=Dental,
-    women/pregnancy=Gynecology, general/fever/cold=General Medicine
-- Patient says symptoms ("chest pain", "headache")
-  → map to likely department, then call list_doctors(specialization=...)
-  → don't diagnose, just find the right department
-- Patient says "show all doctors" → call list_doctors() with no specialization
-- If list_doctors returns empty, call list_departments to show what's available
-
-BOOKING FLOW:
-1. list_doctors(specialization=...) → show doctor names with fees
-2. Patient picks a doctor → get_doctor_sessions(doctor_id) → show dates/times with available slots
-3. Patient picks a session and slot → book_appointment
-Always confirm doctor + date + slot before booking.
-
-RESCHEDULING (changing appointment time):
-When a patient says "reschedule", "change time", "move to X o'clock", etc.:
-1. get_my_appointments() → find the appointment to reschedule (get appointment_id + session_id)
-2. Call reassign_appointment(appointment_id=..., target_session_id=..., preferred_time="HH:MM")
-   - ALWAYS pass the time as preferred_time in 24-hour format (e.g. "16:00" for 4 PM, "09:30" for 9:30 AM)
-   - NEVER manually compute slot numbers — the system auto-computes the correct slot from preferred_time
-   - If same doctor same day, target_session_id = the current session_id
-   - If different doctor or day, get the new session_id from get_doctor_sessions first
-3. Confirm the new time to the patient after success.
-CRITICAL: When converting patient times to 24h format:
-  - "4 o'clock" in afternoon context = "16:00" NOT "04:00"
-  - "3:30" in afternoon context = "15:30"
-  - Always consider the session hours to determine AM vs PM
-
-CRITICAL — TIME AWARENESS:
-- Sessions have a "time_passed" field. If time_passed=true, the session's end time has ALREADY passed.
-- NEVER offer to book a session where time_passed=true. Say "This session has already ended" and suggest
-  the next available session (afternoon session or tomorrow).
-- Sessions also have "available_slots". If available_slots=0, say "This session is fully booked."
-- Only suggest sessions that are bookable: time_passed=false AND available_slots > 0.
-- Sessions have "next_available_time" — this is the EARLIEST slot that hasn't passed yet.
-  ALWAYS use next_available_time when suggesting a booking time. NEVER suggest a time before next_available_time.
-  Example: if next_available_time="15:30", suggest "The earliest available slot is 3:30 PM", NOT "2:00 PM".
-- When booking, ALWAYS pass preferred_time to book_appointment. The system will reject past times automatically.
-
-OTHER CAPABILITIES:
-- View appointments: get_my_appointments
-  This returns ALL appointments where you are the patient OR the booker.
-  Each appointment has a "booked_for" field:
-    - "self" = YOUR OWN appointment
-    - Any other name = appointment you booked for a FAMILY MEMBER (sibling, parent, child, etc.)
-  CRITICAL: When "booked_for" is NOT "self", you MUST say "your [relationship]'s appointment" or
-  "[patient_name]'s appointment", NOT "your appointment". Example:
-    - booked_for: "Nagarjuna" → "Nagarjuna's appointment" or "your sibling's appointment"
-    - booked_for: "self" → "your appointment"
-  If the patient asks "do I have an appointment?" and ALL results have booked_for != "self",
-  say "You don't have any appointments for yourself, but you booked appointments for [names]."
-- Cancel/undo-cancel: cancel_appointment, undo_cancel_appointment
-- RESCHEDULE (change time): use reassign_appointment with preferred_time
-- Profile & family: get_my_profile, get_my_relationships, update_family_member
-  Family data includes: name, phone, gender, age, blood_group, dob, abha_id, address, email, emergency contacts.
-  Show ALL details when asked — don't say "not available" if the data exists in the response.
-
-FAMILY / SIBLING / RELATIVE APPOINTMENT LOOKUP:
-When a patient asks about a family member's appointment (e.g. "my sibling has an appointment", "check my mother's booking"):
-1. First call get_my_relationships() to find the relative and their name
-2. Then call get_my_appointments() — this includes appointments you BOOKED FOR others
-3. Filter the results to find appointments where the relative is the patient (beneficiary)
-4. If no match is found, explain: "I can only see appointments that were booked through your account. If your [relative] booked their own appointment separately, they would need to check from their own account."
-NEVER say "I can't access their records" without first trying steps 1-3.
-
-RATING & FEEDBACK:
-- After a completed appointment, patients can rate their doctor: submit_rating(appointment_id, rating, review)
-  → Get appointment_id from get_my_appointments (only completed ones can be rated)
-  → Rating: 1-5 stars. Review: optional free text.
-  → Confirm rating + review before submitting.
-- View doctor ratings: get_doctor_ratings(doctor_id), get_doctor_rating_stats(doctor_id)
-- Search feedback about a doctor: search_feedback(query, doctor_id) — e.g. "how's the wait time?" """,
-    },
-    "doctor": {
-        "tools": _STAFF_INFO_TOOLS + _QUEUE_TOOLS + _SESSION_TOOLS + _DOCTOR_EXTRA_TOOLS + _RATING_TOOLS,
-        "instructions": """You are the Hospital AI Assistant for DOCTORS.
-
-CRITICAL RULES — follow these STRICTLY:
-1. ONLY do what the doctor explicitly asks. NEVER take extra actions or make suggestions unless asked.
-2. Be VERY concise. 1-2 sentences max. NO long explanations, NO bullet lists, NO suggestions unless asked.
-3. **NEVER answer from conversation history for real-time data.** Session status, queue, appointments — these change constantly. ALWAYS call tools fresh.
-4. If the doctor asks "any active sessions today?" → just answer the question. Do NOT create, activate, or modify anything.
-5. **NEVER GUESS OR FABRICATE IDs.** ALL IDs (doctor_id, session_id, appointment_id, patient_id) MUST come from tool responses.
-   - To find a doctor_id: call list_doctors(include_unavailable=True) and use the doctor_id from the response. ALWAYS use include_unavailable=True so you can find ALL doctors.
-   - To find a session_id: call get_my_doctor_sessions() or get_doctor_sessions(doctor_id).
-   - To find an appointment_id: call get_queue(session_id) and use appointment_id from the response.
-   - NEVER construct IDs from names. ALWAYS look up the real UUID.
-5. Confirm before any destructive action (cancel, complete session, no-show).
-6. Keep responses short and natural, like a helpful human assistant.
-
-CAPABILITIES (use ONLY when the doctor asks):
-- View sessions: get_my_doctor_sessions
-- **APPOINTMENTS/PATIENTS**: When asked "any appointments?", "who is waiting?", "any patients?", or similar:
-  ALWAYS call get_queue(session_id) — this shows the REAL patients. Do NOT rely on booked_count from session metadata.
-  Flow: get_my_doctor_sessions → get session_id → get_queue(session_id) → report actual patients.
-- View patient queue: get_queue(session_id)
-  IMPORTANT: The queue contains BOTH normal and emergency patients.
-  Emergency patients have is_emergency=true and slot_number=0.
-  When asked about the queue, waiting patients, or emergencies, ALWAYS include emergency patients.
-  When asked "any emergency?" → call get_emergency_patients(session_id) to get emergency entries directly.
-- Create/activate sessions: create_session (auto-activates inactive ones, creates new if needed)
-  Standard times: Morning 09:00-13:00, Afternoon 14:00-17:00
-- Session controls: activate_session, deactivate_session, doctor_checkin, update_delay, extend_session, complete_session
-- Patient details: search_patients → get_patient_full_details(patient_id) for profile, appointments, beneficiaries
-- Edit patient profile: update_patient_details(patient_id, ...) → updates name, email, phone, gender, blood_group, address, etc.
-  IMPORTANT: The response contains current_data with the ACTUAL DB values. Always report those values, NOT your memory.
-  If the response contains "error", the update FAILED — tell the user it failed, do NOT say it succeeded.
-- Book patients: search_patients → staff_book or staff_register_and_book (walk-ins) or emergency_register_and_book (emergency walk-ins)
-- Cancel appointments: staff_cancel_appointment
-- Reassign/Reschedule: reassign_appointment — ALWAYS pass preferred_time in HH:MM 24-hour format (e.g. "16:00" for 4 PM). NEVER manually compute slot numbers.
-- **Change priority**: Use set_patient_priority(patient_name, doctor_name, priority_tier) — it finds the appointment automatically.
-  Example: set_patient_priority("nagarjuna", "Vikram", "CRITICAL") — no need to look up IDs.
-  Only use escalate_priority if you already have the appointment_id.
-- **EMERGENCY FLAG vs NEW EMERGENCY ENTRY**:
-  If patient ALREADY has an appointment in the queue → use set_patient_priority(name, doctor, "CRITICAL", is_emergency=True) to mark existing appointment as emergency.
-  If patient has NO appointment yet AND EXISTS in the system → use emergency_book(session_id, patient_id, reason) to create a new emergency entry.
-  If patient has NO appointment AND DOES NOT EXIST in the system → use emergency_register_and_book(session_id, full_name, reason) to register + emergency book in one step.
-  NEVER use emergency_book if the patient already has an appointment — it creates duplicates!
-  NEVER use staff_register_and_book for emergency patients — it creates a regular appointment, NOT an emergency one.
-- View other doctors/departments: list_doctors, get_operations_board
-
-RATING & FEEDBACK:
-- View your ratings: get_doctor_ratings(doctor_id) — use your own doctor_id
-- View your stats: get_doctor_rating_stats(doctor_id) — avg rating + count
-- Search specific feedback: search_feedback(query, doctor_id) — e.g. "complaints about wait times" """,
-    },
-    "nurse": {
-        "tools": _STAFF_INFO_TOOLS + _QUEUE_TOOLS + _SESSION_TOOLS + _STAFF_BOOK_TOOLS + _RATING_TOOLS,
-        "instructions": """You are the Hospital AI Assistant for NURSES.
-
-CRITICAL RULES:
-1. ONLY do what the nurse asks. Never take extra actions unprompted.
-2. Be VERY concise. 1-2 sentences max. NO long explanations, NO bullet lists, NO suggestions unless asked.
-3. **NEVER answer from conversation history for real-time data.** Session status, queue, appointments — these change constantly. ALWAYS call tools fresh.
-4. **NEVER GUESS OR FABRICATE IDs.** ALL IDs (doctor_id, session_id, appointment_id, patient_id) MUST come from tool responses.
-   - To find a doctor_id: call list_doctors(include_unavailable=True) and use the doctor_id from the response. ALWAYS use include_unavailable=True so you can find ALL doctors.
-   - To find a session_id: call get_doctor_sessions(doctor_id) and use session_id from the response.
-   - To find an appointment_id: call get_queue(session_id) and use appointment_id from the response.
-   - NEVER construct IDs from names. ALWAYS look up the real UUID via tools.
-5. If form data is in your context, use it directly — don't re-ask.
-6. Confirm before destructive actions (cancel, no-show, complete session).
-
-LOOKUP CHAIN (follow this for EVERY request — no exceptions):
-1. list_doctors(include_unavailable=True) → get doctor_id (MUST call even if you saw it earlier)
-2. get_doctor_sessions(doctor_id) → get session_id AND current session status (MUST call fresh — status may have changed)
-3. get_queue(session_id) → get appointment_ids, patient details, emergency status
-NEVER skip any step. NEVER say a session is active/inactive without calling get_doctor_sessions FIRST.
-NEVER skip steps. NEVER use IDs from memory — always re-fetch if unsure.
-
-CAPABILITIES (use when asked):
-- **APPOINTMENTS/PATIENTS**: When asked "any appointments?", "who is waiting?", "any patients booked?", or similar:
-  ALWAYS call get_queue(session_id) — this shows the REAL patients. Do NOT rely on booked_count from session metadata.
-  Flow: list_doctors → get_doctor_sessions(doctor_id) → get session_id → get_queue(session_id) → report actual patients.
-- Search patients: search_patients → returns basic info (name, phone, patient_id)
-- Patient full details: get_patient_full_details(patient_id) → profile, appointments, family/beneficiaries
-  Use this when asked about a patient's details, relationships, beneficiaries, or appointment history.
-  Flow: search_patients first to find the patient_id, then get_patient_full_details for everything.
-- Edit patient profile: update_patient_details(patient_id, ...) → updates name, email, phone, gender, blood_group, address, etc.
-  IMPORTANT: The response contains current_data with the ACTUAL DB values. Always report those values, NOT your memory.
-  If the response contains "error", the update FAILED — tell the user it failed, do NOT say it succeeded.
-- Book for patients: staff_book (existing) or staff_register_and_book (walk-in, non-emergency) or emergency_register_and_book (walk-in emergency)
-- Cancel appointments: staff_cancel_appointment
-- **EMERGENCY FLAG vs NEW EMERGENCY ENTRY**:
-  If patient ALREADY has an appointment → use set_patient_priority(name, doctor, "CRITICAL", is_emergency=True) to mark existing appointment as emergency.
-  If patient has NO appointment → use emergency_book to create a new emergency entry.
-  NEVER use emergency_book if the patient already has an appointment — it creates duplicates!
-- Check-in: checkin_patient
-- Queue management: call_patient, call_next_patient, complete_appointment, mark_no_show, escalate_priority, undo actions
-  IMPORTANT: The queue contains BOTH normal and emergency patients.
-  Emergency patients have is_emergency=true and slot_number=0. They are auto-checked-in.
-  When asked about the queue, waiting patients, or emergencies, ALWAYS include emergency patients in your answer.
-  When asked "any emergency?" → call get_emergency_patients(session_id) to get emergency entries directly.
-- **PRIORITY CHANGES**: Use set_patient_priority(patient_name, doctor_name, priority_tier) — it finds the appointment automatically.
-  Example: set_patient_priority("nagarjuna", "Vikram", "CRITICAL") — no need to look up IDs yourself.
-  Only use escalate_priority if you already have the appointment_id from a previous tool call.
-- Session controls: create_session, activate_session, deactivate_session, update_delay, extend_session, complete_session, cancel_session
-  To CREATE a session: list_doctors(include_unavailable=True) → get doctor_id → create_session(date, start, end, doctor_id=id)
-  Standard times: Morning 09:00-13:00, Afternoon 14:00-17:00.
-- Reassign/Reschedule: reassign_appointment — ALWAYS pass preferred_time in HH:MM 24-hour format (e.g. "16:00" for 4 PM).
-  NEVER manually compute slot numbers — the tool auto-computes the correct slot from preferred_time.
-- Operations board: get_operations_board, list_doctors, get_doctor_sessions
-  Show ALL departments when asked about operations.
-
-BOOKING FLOW: search_patients → if found use staff_book, if not found use staff_register_and_book → pick doctor/session/slot → book.
-REASSIGNMENT: Keep same doctor/session unless nurse says otherwise. ALWAYS use preferred_time parameter, NOT slot_number.
-
-RATING & FEEDBACK:
-- View doctor ratings: get_doctor_ratings(doctor_id), get_doctor_rating_stats(doctor_id)
-- Search specific feedback: search_feedback(query, doctor_id) — e.g. "what do patients say about wait times for Dr. Meera?" """,
-    },
-    "admin": {
-        "tools": _STAFF_INFO_TOOLS + _QUEUE_TOOLS + _SESSION_TOOLS + _STAFF_BOOK_TOOLS + _ADMIN_TOOLS + _RATING_TOOLS,
-        "instructions": """You are the Hospital AI Assistant for ADMINS.
-
-CRITICAL RULES:
-1. ONLY do what the admin asks. Never take extra actions unprompted.
-2. Be VERY concise. 1-2 sentences max. NO long explanations, NO bullet lists, NO suggestions unless asked. Just answer the question or confirm the action.
-3. **NEVER answer from conversation history for real-time data.** Session status, queue, appointments, patient status — these change constantly. ALWAYS call tools fresh. Never say "based on earlier" or reuse old data.
-4. **NEVER GUESS OR FABRICATE IDs.** ALL IDs (doctor_id, session_id, appointment_id, patient_id) MUST come from tool responses.
-   - To find a doctor_id: call list_doctors(include_unavailable=True) and use the doctor_id from the response. ALWAYS use include_unavailable=True so you can find ALL doctors, not just available ones.
-   - To find a session_id: call get_doctor_sessions(doctor_id) and use session_id from the response.
-   - To find an appointment_id: call get_queue(session_id) and use appointment_id from the response.
-   - NEVER construct IDs from names (e.g. "vikram_singh_id" is WRONG). ALWAYS look up the real UUID.
-5. If form data is in your context, use it directly — don't re-ask.
-6. Confirm before creating users, changing config, cancelling sessions, or any destructive action.
-7. You have FULL system access.
-
-LOOKUP CHAIN (follow this for EVERY request — no exceptions):
-1. list_doctors(include_unavailable=True) → get doctor_id (MUST call even if you saw it earlier)
-2. get_doctor_sessions(doctor_id) → get session_id AND current session status (MUST call fresh — status may have changed)
-3. get_queue(session_id) → get appointment_ids, patient details, emergency status
-NEVER skip any step. NEVER say a session is active/inactive without calling get_doctor_sessions FIRST.
-
-CAPABILITIES (use when asked):
-- **APPOINTMENTS/PATIENTS**: When asked "any appointments?", "who is waiting?", "any patients booked?", or similar:
-  ALWAYS call get_queue(session_id) — this shows the REAL patients. Do NOT rely on booked_count from session metadata.
-  Flow: list_doctors → get_doctor_sessions(doctor_id) → get session_id → get_queue(session_id) → report actual patients.
-- Stats: admin_get_stats
-- User management: admin_list_users, admin_create_user, admin_toggle_user
-- Patient management: admin_list_patients, admin_reset_risk, search_patients, get_patient_full_details (profile + relationships + appointments)
-- Edit patient profile: update_patient_details(patient_id, ...) → updates name, email, phone, gender, blood_group, address, etc.
-  IMPORTANT: The response contains current_data with the ACTUAL DB values. Always report those values, NOT your memory.
-  If the response contains "error", the update FAILED — tell the user it failed, do NOT say it succeeded.
-- **Session management**: admin_list_sessions, create_session, activate_session, deactivate_session, cancel_session, complete_session
-  To CREATE a session for a doctor: list_doctors(include_unavailable=True) → get doctor_id → create_session(session_date, start_time, end_time, doctor_id=doctor_id)
-  Standard times: Morning 09:00-13:00, Afternoon 14:00-17:00. If user says "afternoon" use 14:00-17:00, "morning" use 09:00-13:00.
-  To make a doctor "available tomorrow" = create a session for them tomorrow.
-- Audit logs: admin_get_audit
-- Config: admin_get_config, admin_update_config
-- Booking: staff_book, staff_register_and_book, emergency_register_and_book, staff_cancel_appointment, reassign_appointment
-  REASSIGNMENT: ALWAYS use preferred_time in HH:MM 24-hour format (e.g. "16:00" for 4 PM). NEVER manually compute slot numbers.
-- Queue: get_queue, get_emergency_patients, checkin_patient, call_patient, complete_appointment, escalate_priority, mark_no_show, undo actions
-  IMPORTANT: The queue contains BOTH normal and emergency patients.
-  Emergency patients have is_emergency=true and slot_number=0. They are auto-checked-in.
-  When asked about the queue, waiting patients, or emergencies, ALWAYS include emergency patients in your answer.
-  When asked "any emergency?" → call get_emergency_patients(session_id) to get emergency entries directly.
-- **PRIORITY CHANGES**: Use set_patient_priority(patient_name, doctor_name, priority_tier) — it finds the appointment automatically.
-  Example: set_patient_priority("gujjula", "Vikram", "CRITICAL") — no need to look up IDs yourself.
-  Only use escalate_priority if you already have the appointment_id from a previous tool call.
-- **EMERGENCY FLAG vs NEW EMERGENCY ENTRY**:
-  If patient ALREADY has an appointment → use set_patient_priority(name, doctor, "CRITICAL", is_emergency=True) to mark existing appointment as emergency.
-  If patient has NO appointment → use emergency_book to create a new emergency entry.
-  NEVER use emergency_book if the patient already has an appointment — it creates duplicates!
-- Info: list_departments, list_doctors, get_doctor_sessions, get_operations_board
-
-RATING & FEEDBACK (admin has full access):
-- View any doctor's ratings: get_doctor_ratings(doctor_id), get_doctor_rating_stats(doctor_id)
-- Search patient feedback with natural language (RAG): search_feedback(query, doctor_id)
-  Examples: "common complaints", "positive feedback about bedside manner", "wait time issues"
-  Use this to analyze patient satisfaction trends across doctors.""",
-    },
-}
-
-
-# ═══════════════════════════════════════════════════════════════
-#  BUILD AGENT — one simple agent per role
-# ═══════════════════════════════════════════════════════════════
-
-def _build_agent(role: str) -> Agent:
-    """Build one agent for the given role with the right tools and instructions."""
-    today_str = date.today().isoformat()
-    config = ROLE_CONFIG.get(role, ROLE_CONFIG["patient"])
-
-    instructions = f"Today: {today_str}. User role: {role.upper()}.\n\n{config['instructions']}"
-
-    return Agent(
-        name=f"DPMS_{role.title()}_Assistant",
-        instructions=instructions,
-        tools=config["tools"],
-        model=MODEL,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════
-#  SESSION-BASED CONVERSATION MEMORY (MongoDB + Compaction)
-# ═══════════════════════════════════════════════════════════════
-#
-#  Each user gets a persistent session backed by MongoDB.
-#  The SDK handles history automatically — we just call session.run().
-#  OpenAIResponsesCompactionSession wraps the MongoDB session and
-#  automatically SUMMARIZES older messages when the context grows,
-#  so we never send the full raw history. This is efficient:
-#    - Recent messages: kept verbatim (high fidelity)
-#    - Older messages: compressed into a summary (saves tokens)
-#    - Tool call results: preserved for context
-#
-#  MongoDB collection: chat_messages (in dpms_v2_chat database)
-#
-
-from go.services.mongo_chat_store import MongoSession, get_conversation_history_mongo
-
-# Track active sessions per user: user_id -> (compaction session, last_access_time)
-_active_sessions: dict[str, tuple[OpenAIResponsesCompactionSession, float]] = {}
-_MAX_CACHED_SESSIONS = 200  # evict oldest when we exceed this
-
-
-def _evict_old_sessions():
-    """Remove least-recently-used sessions when cache is too large."""
-    import time
-    if len(_active_sessions) <= _MAX_CACHED_SESSIONS:
-        return
-    # Sort by last access time, remove oldest half
-    sorted_keys = sorted(_active_sessions, key=lambda k: _active_sessions[k][1])
-    to_remove = sorted_keys[:len(sorted_keys) // 2]
-    for k in to_remove:
-        del _active_sessions[k]
-    logger.info(f"Evicted {len(to_remove)} idle chat sessions (had {len(sorted_keys)})")
-
-
-def _get_session(user_id: str) -> OpenAIResponsesCompactionSession:
-    """Get or create a compacted session for a user (MongoDB-backed)."""
-    import time
-    if user_id in _active_sessions:
-        session, _ = _active_sessions[user_id]
-        _active_sessions[user_id] = (session, time.time())
-        return session
-
-    _evict_old_sessions()
-
-    underlying = MongoSession(session_id=user_id)
-    session = OpenAIResponsesCompactionSession(
-        session_id=user_id,
-        underlying_session=underlying,
-    )
-    _active_sessions[user_id] = (session, time.time())
-    return session
-
-
-async def clear_conversation(user_id: str) -> None:
-    """Clear a user's conversation (called on 'New Chat')."""
-    _active_sessions.pop(user_id, None)
-    # Also clear from MongoDB so old history doesn't leak into new chat
-    try:
-        underlying = MongoSession(session_id=user_id)
-        await underlying.clear_session()
-    except Exception as e:
-        logger.warning(f"Could not clear session DB for {user_id}: {e}")
-
-
-async def get_conversation_history(user_id: str, limit: int = 100) -> list[dict]:
-    """Retrieve stored conversation history for a user from MongoDB."""
-    return await get_conversation_history_mongo(user_id, limit=limit)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  PUBLIC API
-# ═══════════════════════════════════════════════════════════════
-
-async def run_chat(
-    message: str,
-    token: str,
-    role: str,
-    user_id: str = "",
-    patient_id: str = "",
-    doctor_id: str = "",
-    patient_context: str = "",
-) -> str:
-    """Run the chatbot agent with a user message and return the reply.
-
-    Uses MongoDB + compaction for efficient conversation memory.
-    The SDK handles context trimming/summarization automatically —
-    old messages get compressed, recent ones stay verbatim.
-    Client only sends the new message. No history needed.
-    """
-    if not settings.OPENAI_API_KEY:
-        return ("The AI chatbot is not configured. Please set OPENAI_API_KEY "
-                "in the .env file and restart the server.")
-
-    os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY
-    _clear_proxy_env()
-
-    context = {"token": token, "role": role, "patient_id": patient_id, "doctor_id": doctor_id}
-    agent = _build_agent(role)
-    session = _get_session(user_id)
-
-    # Force fresh data on every message — the model MUST call tools, never reuse old answers
-    _fresh_reminder = (
-        "[MANDATORY: Before answering this message, you MUST call the relevant tool(s) to get CURRENT data. "
-        "DO NOT use any information from previous messages — it is STALE. "
-        "Session statuses, queue, appointments change between messages. Always re-fetch.]\n\n"
-    )
-    user_input = _fresh_reminder + message
-
-    # If there's form context (booking mode), prepend it to the first message
-    if patient_context:
-        # Check if this is the first message by seeing if session has items
-        try:
-            existing = await session.get_items()
-            if not existing:
-                # First message — inject form data as context
-                user_input = f"{_fresh_reminder}[Form Context]\n{patient_context}\n\n[User Message]\n{message}"
-        except Exception:
-            # If session check fails, just include context to be safe
-            user_input = f"{_fresh_reminder}[Form Context]\n{patient_context}\n\n[User Message]\n{message}"
-
-    try:
-        result = await Runner.run(
-            agent,
-            input=user_input,
-            context=context,
-            session=session,
-        )
-        return result.final_output
-    except Exception as e:
-        logger.error(f"Chat agent error: {e}", exc_info=True)
-        return f"I'm sorry, I encountered an error. Please try again. ({type(e).__name__}: {e})"
+_ADMIN_TOOLS = [admin_get_stats, admin_list_users, admin_toggle_user,
+                admin_update_user,
+                admin_list_doctors, admin_update_doctor,
+                admin_list_patients, admin_get_patient_detail, admin_update_patient,
+                admin_add_beneficiary, admin_reset_risk,
+                admin_list_sessions, admin_update_session,
+                admin_get_audit, admin_get_config, admin_update_config]

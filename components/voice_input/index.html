@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: transparent; }
+
+  #root {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 4px;
+  }
+
+  #mic-btn {
+    width: 48px; height: 48px;
+    border-radius: 50%;
+    border: 2px solid #3498db;
+    background: #f0f4f8;
+    font-size: 22px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    flex-shrink: 0;
+  }
+  #mic-btn:hover { background: #e0eaf4; }
+  #mic-btn.listening {
+    border-color: #e74c3c;
+    background: #fdeaea;
+    animation: pulse 1.5s infinite;
+  }
+  #mic-btn.paused {
+    border-color: #f39c12;
+    background: #fef9e7;
+    animation: none;
+  }
+
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(231,76,60,0.4); }
+    50% { box-shadow: 0 0 0 10px rgba(231,76,60,0); }
+  }
+
+  #info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+  #status-text {
+    font-size: 13px;
+    color: #888;
+  }
+  #status-text.active { color: #e74c3c; font-weight: 500; }
+  #interim-text {
+    font-size: 13px;
+    color: #555;
+    font-style: italic;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #unsupported {
+    display: none;
+    font-size: 13px;
+    color: #c0392b;
+    padding: 8px;
+  }
+</style>
+</head>
+<body>
+
+<div id="root">
+  <button id="mic-btn" onclick="toggleListening()">&#x1F3A4;</button>
+  <div id="info">
+    <span id="status-text">Click to start hands-free voice</span>
+    <span id="interim-text"></span>
+  </div>
+</div>
+<div id="unsupported"></div>
+
+<script>
+// ── Streamlit Component Communication Shim ──────────────────
+function sendToStreamlit(type, data) {
+  window.parent.postMessage(
+    Object.assign({ isStreamlitMessage: true, type: type }, data),
+    "*"
+  );
+}
+function setComponentValue(value) {
+  sendToStreamlit("streamlit:setComponentValue", { value: value });
+}
+function setFrameHeight(h) {
+  sendToStreamlit("streamlit:setFrameHeight", { height: h });
+}
+function componentReady() {
+  sendToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+}
+
+// ── State ───────────────────────────────────────────────────
+let listening = false;
+let recognition = null;
+let shouldRestart = false;
+let autoStartDone = false;   // prevent repeated auto-starts on re-render
+let pausedForTTS = false;    // true when mic is muted because assistant is speaking
+
+// ── Speech Recognition ──────────────────────────────────────
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+function initRecognition() {
+  if (!SpeechRecognition) {
+    document.getElementById("root").style.display = "none";
+    const el = document.getElementById("unsupported");
+    el.style.display = "block";
+    el.textContent = "Speech Recognition not supported in this browser. Use Chrome or Edge.";
+    return null;
+  }
+
+  const rec = new SpeechRecognition();
+  rec.continuous   = true;
+  rec.interimResults = true;
+  rec.lang = "en-US";
+  rec.maxAlternatives = 1;
+
+  rec.onresult = function(event) {
+    let interim = "";
+    let finalTranscript = "";
+
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      var txt = event.results[i][0].transcript;
+      if (event.results[i].isFinal) {
+        finalTranscript += txt;
+      } else {
+        interim += txt;
+      }
+    }
+
+    // Show interim results
+    document.getElementById("interim-text").textContent = interim ? interim : "";
+
+    // When we have a final transcript, send it to Streamlit
+    if (finalTranscript.trim()) {
+      document.getElementById("interim-text").textContent = "";
+      setComponentValue({
+        transcript: finalTranscript.trim(),
+        ts: Date.now()
+      });
+    }
+  };
+
+  rec.onend = function() {
+    // Auto-restart if user hasn't toggled off
+    if (shouldRestart) {
+      setTimeout(function() {
+        try { rec.start(); } catch(e) { /* ignore */ }
+      }, 80);
+    } else {
+      updateUI(false);
+    }
+  };
+
+  rec.onerror = function(event) {
+    if (event.error === "no-speech" || event.error === "aborted") {
+      // Benign — just restart
+      if (shouldRestart) {
+        setTimeout(function() {
+          try { rec.start(); } catch(e) { /* ignore */ }
+        }, 150);
+      }
+    } else if (event.error === "not-allowed") {
+      document.getElementById("status-text").textContent = "Mic permission denied — please allow in browser";
+      shouldRestart = false;
+      updateUI(false);
+    } else {
+      console.error("SpeechRecognition error:", event.error);
+      if (shouldRestart) {
+        setTimeout(function() {
+          try { rec.start(); } catch(e) { /* ignore */ }
+        }, 300);
+      }
+    }
+  };
+
+  return rec;
+}
+
+function updateUI(isListening) {
+  listening = isListening;
+  var btn    = document.getElementById("mic-btn");
+  var status = document.getElementById("status-text");
+
+  if (isListening) {
+    btn.classList.add("listening");
+    btn.innerHTML = "&#x1F534;";          // red circle
+    status.textContent = "Listening... speak naturally";
+    status.classList.add("active");
+  } else {
+    btn.classList.remove("listening");
+    btn.innerHTML = "&#x1F3A4;";          // microphone
+    status.textContent = "Click to start hands-free voice";
+    status.classList.remove("active");
+    document.getElementById("interim-text").textContent = "";
+  }
+}
+
+function toggleListening() {
+  if (listening) {
+    stopListening();
+  } else {
+    startListening();
+  }
+}
+
+function startListening() {
+  if (!recognition) recognition = initRecognition();
+  if (!recognition) return;
+  shouldRestart = true;
+  document.getElementById("mic-btn").classList.remove("paused");
+  try {
+    recognition.start();
+    updateUI(true);
+  } catch(e) {
+    // Already started — ignore
+    updateUI(true);
+  }
+}
+
+function stopListening() {
+  shouldRestart = false;
+  if (recognition) {
+    try { recognition.stop(); } catch(e) { /* ignore */ }
+  }
+  updateUI(false);
+}
+
+// ── Streamlit render handler ────────────────────────────────
+window.addEventListener("message", function(event) {
+  if (event.data && event.data.type === "streamlit:render") {
+    var args = event.data.args || {};
+
+    // Auto-start listening on first render when voice mode is active
+    if (args.auto_start && !autoStartDone) {
+      autoStartDone = true;
+      startListening();
+    }
+    // If Streamlit tells us to stop (voice mode turned off)
+    if (args.auto_start === false && listening) {
+      stopListening();
+    }
+    // Resume listening after a Streamlit rerun (component was re-created)
+    if (args.resume && !listening) {
+      startListening();
+    }
+  }
+});
+
+// ── TTS-aware pause/resume ───────────────────────────────────
+// When the assistant speaks (TTS audio plays), pause mic so it doesn't
+// pick up the assistant's voice and create a feedback loop.
+var _boundAudios = new WeakSet();
+
+function monitorParentAudio() {
+  try {
+    var audios = window.parent.document.querySelectorAll("audio");
+    audios.forEach(function(a) {
+      if (_boundAudios.has(a)) return;
+      _boundAudios.add(a);
+
+      a.addEventListener("play", function() {
+        if (listening && shouldRestart) {
+          pausedForTTS = true;
+          shouldRestart = false;                 // prevent auto-restart in onend
+          if (recognition) {
+            try { recognition.stop(); } catch(e) {}
+          }
+          var s = document.getElementById("status-text");
+          s.textContent = "Paused — assistant speaking...";
+          s.classList.remove("active");
+          var btn = document.getElementById("mic-btn");
+          btn.classList.remove("listening");
+          btn.classList.add("paused");
+          btn.innerHTML = "&#x23F8;"; // pause icon
+        }
+      });
+
+      a.addEventListener("ended", resumeAfterTTS);
+      a.addEventListener("pause", resumeAfterTTS);
+    });
+  } catch(e) {
+    // cross-origin — fallback: can't monitor, do nothing
+  }
+}
+
+function resumeAfterTTS() {
+  if (!pausedForTTS) return;
+  pausedForTTS = false;
+  // Small delay so browser releases audio device
+  setTimeout(function() {
+    startListening();
+  }, 400);
+}
+
+// Poll for new <audio> elements (Streamlit re-creates them on reruns)
+setInterval(monitorParentAudio, 500);
+
+// ── Init ────────────────────────────────────────────────────
+componentReady();
+setFrameHeight(60);
+</script>
+</body>
+</html>

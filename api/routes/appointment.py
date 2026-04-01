@@ -503,6 +503,11 @@ async def emergency_book_route(
     if session.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Session is {session.status}")
 
+    # Block past session dates
+    from datetime import date as _bk_date
+    if session.session_date < _bk_date.today():
+        raise HTTPException(status_code=400, detail="Cannot book emergency for a past date.")
+
     # Validate patient exists
     patient = await PatientModel.get_by_id(db, patient_id)
     if not patient:
@@ -796,6 +801,19 @@ async def staff_book(
         raise HTTPException(status_code=400, detail=f"Session is '{session.status}'. Please activate it before booking.")
     if slot_number < 1 or slot_number > session.total_slots:
         raise HTTPException(status_code=400, detail=f"Invalid slot. Must be 1-{session.total_slots}")
+
+    # Block past session dates and past time slots
+    from datetime import date as _bk_date, datetime as _bk_dt
+    if session.session_date < _bk_date.today():
+        raise HTTPException(status_code=400, detail="Cannot book an appointment for a past date.")
+    if session.session_date == _bk_date.today():
+        _now_min = _bk_dt.now().hour * 60 + _bk_dt.now().minute
+        _slot_start = (
+            session.start_time.hour * 60 + session.start_time.minute
+            + (slot_number - 1) * session.slot_duration_minutes
+        )
+        if _slot_start <= _now_min:
+            raise HTTPException(status_code=400, detail="Cannot book a time slot that has already passed.")
 
     # Validate patient
     patient = await PatientModel.get_by_id(db, patient_id)

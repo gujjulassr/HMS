@@ -32,7 +32,8 @@ async def lifespan(app: FastAPI):
         await mongo_ensure_indexes()
     except Exception as e:
         import logging
-        logging.getLogger(__name__).warning(f"[MongoDB] Could not connect on startup (chat will retry lazily): {e}")
+        logging.getLogger(__name__).critical(f"[MongoDB] Failed to connect on startup — chat will NOT work: {e}")
+        raise RuntimeError(f"MongoDB is required but unreachable: {e}") from e
     yield
     await close_mongo()
     await close_db()
